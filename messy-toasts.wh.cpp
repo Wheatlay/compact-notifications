@@ -7,7 +7,6 @@
 // @github          https://github.com/Wheatlay
 // @include         ShellExperienceHost.exe
 // @include         explorer.exe
-// @include         windhawk.exe
 // @compilerOptions -lole32 -loleaut32 -ldwmapi -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs
 // ==/WindhawkMod==
 
@@ -43,6 +42,41 @@ Avatars come from the toast's appLogoOverride image when it is a local file. Not
 #include <mutex>
 #include <string>
 #include <vector>
+
+// Development log: besides Windhawk's log, lines go to %TEMP%\messy-toasts.log if that file exists
+// (create it to turn this on, delete it to turn it off).
+void FileLog(const wchar_t* format, ...) {
+    WCHAR path[MAX_PATH];
+    if (!GetTempPathW(ARRAYSIZE(path), path) || wcscat_s(path, L"messy-toasts.log") != 0 ||
+        GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        return;
+    }
+    WCHAR line[1024];
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    int prefix = swprintf(line, ARRAYSIZE(line), L"%02d:%02d:%02d.%03d %lu ", now.wHour, now.wMinute, now.wSecond,
+                          now.wMilliseconds, GetCurrentProcessId());
+    va_list args;
+    va_start(args, format);
+    vswprintf(line + prefix, ARRAYSIZE(line) - prefix - 2, format, args);
+    va_end(args);
+    wcscat_s(line, L"\n");
+    char utf8[4096];
+    int size = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof(utf8), nullptr, nullptr) - 1;
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                              nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(file, utf8, size > 0 ? size : 0, &written, nullptr);
+        CloseHandle(file);
+    }
+}
+
+#define Log(format, ...)                         \
+    do {                                         \
+        Wh_Log(format, ##__VA_ARGS__);           \
+        FileLog(format, ##__VA_ARGS__);          \
+    } while (0)
 
 // The banner window title (String resource \ActionCenter\AC_ToastCenter_Title). Only languages in use here.
 const wchar_t* const kBannerTitles[] = {L"Nowe powiadomienie", L"New notification", L"Neue Benachrichtigung"};
@@ -171,7 +205,7 @@ bool LoadSqlite() {
     }
     HMODULE module = LoadLibraryExW(L"winsqlite3.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!module) {
-        Wh_Log(L"winsqlite3.dll unavailable");
+        Log(L"winsqlite3.dll unavailable");
         return false;
     }
     auto get = [module](const char* name) { return (void*)GetProcAddress(module, name); };
@@ -272,7 +306,7 @@ std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
     std::string path = ToUtf8(std::wstring(localAppData) + L"\\Microsoft\\Windows\\Notifications\\wpndatabase.db");
     sqlite3* db = nullptr;
     if (g_sqlite.open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != 0) {
-        Wh_Log(L"Opening the notification database failed");
+        Log(L"Opening the notification database failed");
         if (db) {
             g_sqlite.close(db);
         }
@@ -413,7 +447,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
         Com<IUIAutomation> uia;
         if (FAILED(CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, __uuidof(IUIAutomation),
                                     reinterpret_cast<void**>(uia.put())))) {
-            Wh_Log(L"UI Automation unavailable");
+            Log(L"UI Automation unavailable");
             CoUninitialize();
             return 0;
         }
@@ -483,7 +517,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
                         ToastInfo info{id, ChildName(element, senderCondition->p), ChildName(element, titleCondition->p),
                                        ChildName(element, textCondition->p)};
                         info.image = FindAvatar(info.title, info.text);
-                        Wh_Log(L"Toast %s: %s / %s [%s]", info.app.c_str(), info.title.c_str(), info.text.c_str(),
+                        Log(L"Toast %s: %s / %s [%s]", info.app.c_str(), info.title.c_str(), info.text.c_str(),
                                info.image.c_str());
                         current.push_back({info, element});
                     }
@@ -607,7 +641,7 @@ ID2D1Bitmap* LoadBitmap(const std::wstring& path) {
         g_target->CreateBitmapFromWicBitmap(converter, nullptr, &bitmap);
     }
     if (!bitmap) {
-        Wh_Log(L"Loading the avatar failed: %s", path.c_str());
+        Log(L"Loading the avatar failed: %s", path.c_str());
     }
     for (IUnknown* object : std::initializer_list<IUnknown*>{converter, frame, decoder}) {
         if (object) {
@@ -975,6 +1009,7 @@ DWORD WINAPI UiThread(LPVOID) {
         RegisterClassW(&wc);
         g_window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName,
                                    L"Messy toasts", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+        Log(L"Card window %p (error %lu)", g_window, g_window ? 0 : GetLastError());
         MSG msg;
         while (GetMessage(&msg, nullptr, 0, 0) > 0) {
             DispatchMessage(&msg);
@@ -983,7 +1018,7 @@ DWORD WINAPI UiThread(LPVOID) {
         g_window = nullptr;
         UnregisterClassW(wc.lpszClassName, wc.hInstance);
     } else {
-        Wh_Log(L"Direct2D/DirectWrite unavailable");
+        Log(L"Direct2D/DirectWrite unavailable");
     }
     ReleaseResources();
     CoUninitialize();
@@ -1006,68 +1041,15 @@ void WhTool_ModUninit() {
     WaitForSingleObject(g_uiThread, INFINITE);
 }
 
+
 ////////////////////////////////////////////////////////////////////////////////
-// Process roles: ShellExperienceHost and explorer only hide the banner; the drawing runs in a dedicated windhawk.exe
-// process (tool mod), so a crash there never takes down the shell.
-// https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process
+// Process roles: ShellExperienceHost only hides the banner; explorer hides it too (some builds move it from there)
+// and one explorer process also reads the toasts and draws the cards. Windhawk's separate "tool mod" process didn't
+// survive reloads, and explorer is always running anyway.
 
-enum class Role { None, Shell, ToolLauncher, Tool };
+enum class Role { None, Shell, ShellWithCards };
 Role g_role = Role::None;
-HANDLE g_toolModProcessMutex;
-
-void WINAPI EntryPoint_Hook() {
-    ExitThread(0);
-}
-
-BOOL InitTool() {
-    DWORD sessionId;
-    if (ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) && sessionId == 0) {
-        return FALSE;
-    }
-    bool isExcluded = false, isToolModProcess = false, isCurrentToolModProcess = false;
-    int argc;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
-    if (!argv) {
-        return FALSE;
-    }
-    for (int i = 1; i < argc; i++) {
-        if (wcscmp(argv[i], L"-service") == 0 || wcscmp(argv[i], L"-service-start") == 0 ||
-            wcscmp(argv[i], L"-service-stop") == 0) {
-            isExcluded = true;
-        }
-    }
-    for (int i = 1; i < argc - 1; i++) {
-        if (wcscmp(argv[i], L"-tool-mod") == 0) {
-            isToolModProcess = true;
-            isCurrentToolModProcess = wcscmp(argv[i + 1], WH_MOD_ID) == 0;
-            break;
-        }
-    }
-    LocalFree(argv);
-    if (isExcluded) {
-        return FALSE;
-    }
-    if (isCurrentToolModProcess) {
-        g_toolModProcessMutex = CreateMutex(nullptr, TRUE, L"windhawk-tool-mod_" WH_MOD_ID);
-        if (!g_toolModProcessMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
-            ExitProcess(1);
-        }
-        if (!WhTool_ModInit()) {
-            ExitProcess(1);
-        }
-        IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)GetModuleHandle(nullptr);
-        IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)((BYTE*)dosHeader + dosHeader->e_lfanew);
-        void* entryPoint = (BYTE*)dosHeader + ntHeaders->OptionalHeader.AddressOfEntryPoint;
-        Wh_SetFunctionHook(entryPoint, (void*)EntryPoint_Hook, nullptr);
-        g_role = Role::Tool;
-        return TRUE;
-    }
-    if (isToolModProcess) {
-        return FALSE;
-    }
-    g_role = Role::ToolLauncher;
-    return TRUE;
-}
+HANDLE g_cardsMutex = nullptr;
 
 BOOL Wh_ModInit() {
     WCHAR path[MAX_PATH];
@@ -1076,60 +1058,40 @@ BOOL Wh_ModInit() {
     }
     const WCHAR* base = wcsrchr(path, L'\\');
     base = base ? base + 1 : path;
-    if (_wcsicmp(base, L"ShellExperienceHost.exe") == 0 || _wcsicmp(base, L"explorer.exe") == 0) {
-        g_role = Role::Shell;
-        Wh_SetFunctionHook((void*)SetWindowPos, (void*)SetWindowPos_Hook, (void**)&SetWindowPos_Original);
-        return TRUE;
+    bool explorer = _wcsicmp(base, L"explorer.exe") == 0;
+    if (!explorer && _wcsicmp(base, L"ShellExperienceHost.exe") != 0) {
+        return FALSE;
     }
-    return InitTool();
+    Wh_SetFunctionHook((void*)SetWindowPos, (void*)SetWindowPos_Hook, (void**)&SetWindowPos_Original);
+    g_role = Role::Shell;
+    // With "open folders in a separate process" there are several explorers: only the first one draws.
+    if (explorer) {
+        g_cardsMutex = CreateMutex(nullptr, TRUE, L"windhawk_" WH_MOD_ID L"_cards");
+        if (g_cardsMutex && GetLastError() != ERROR_ALREADY_EXISTS) {
+            g_role = Role::ShellWithCards;
+        } else if (g_cardsMutex) {
+            CloseHandle(g_cardsMutex);
+            g_cardsMutex = nullptr;
+        }
+    }
+    Log(L"Loaded in %s, %s", base, g_role == Role::ShellWithCards ? L"drawing cards" : L"hiding only");
+    return TRUE;
 }
 
 void Wh_ModAfterInit() {
-    if (g_role == Role::Shell) {
-        HideExistingBanner();
-        return;
-    }
-    if (g_role != Role::ToolLauncher) {
-        return;
-    }
-    WCHAR currentProcessPath[MAX_PATH];
-    switch (GetModuleFileName(nullptr, currentProcessPath, ARRAYSIZE(currentProcessPath))) {
-        case 0:
-        case ARRAYSIZE(currentProcessPath):
-            return;
-    }
-    WCHAR commandLine[MAX_PATH + 2 + (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)) - 1];
-    swprintf(commandLine, ARRAYSIZE(commandLine), L"\"%s\" -tool-mod \"%s\"", currentProcessPath, WH_MOD_ID);
-    HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
-    if (!kernelModule && !(kernelModule = GetModuleHandle(L"kernel32.dll"))) {
-        return;
-    }
-    using CreateProcessInternalW_t = BOOL(WINAPI*)(HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
-                                                   LPSECURITY_ATTRIBUTES, WINBOOL, DWORD, LPVOID, LPCWSTR,
-                                                   LPSTARTUPINFOW, LPPROCESS_INFORMATION, PHANDLE);
-    auto pCreateProcessInternalW = (CreateProcessInternalW_t)GetProcAddress(kernelModule, "CreateProcessInternalW");
-    if (!pCreateProcessInternalW) {
-        return;
-    }
-    STARTUPINFO si{.cb = sizeof(STARTUPINFO), .dwFlags = STARTF_FORCEOFFFEEDBACK};
-    PROCESS_INFORMATION pi;
-    if (pCreateProcessInternalW(nullptr, currentProcessPath, commandLine, nullptr, nullptr, FALSE,
-                                NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si, &pi, nullptr)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+    HideExistingBanner();
+    if (g_role == Role::ShellWithCards && !WhTool_ModInit()) {
+        Log(L"Starting the cards failed");
     }
 }
 
-void Wh_ModSettingsChanged() {
-    if (g_role == Role::Tool) {
-        WhTool_ModSettingsChanged();
-    }
-}
+void Wh_ModSettingsChanged() {}
 
 void Wh_ModUninit() {
-    if (g_role == Role::Tool) {
+    if (g_role == Role::ShellWithCards) {
         WhTool_ModUninit();
-        ExitProcess(0);
+        ReleaseMutex(g_cardsMutex);
+        CloseHandle(g_cardsMutex);
     }
-    // Shell: the hook goes away with the mod and Windows places the next banner on the screen again.
+    // The hook goes away with the mod and Windows places the next banner on the screen again.
 }
