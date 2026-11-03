@@ -29,7 +29,8 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
 * **Reply box**: click it and type, then press the app's send button. The text goes to the original reply
   box, so the app receives it as usual.
 * **Avatars**: the notification's image (local files, web images and images from Store apps), or a thumbnail of
-  its large picture (e.g. a screenshot); otherwise the first letter of the app.
+  its large picture (e.g. a screenshot); otherwise the app's registered icon (e.g. Firefox), and the first
+  letter of the app as the last resort.
 * **Priority notifications** (reminders, alarms, incoming calls) get a colored outline and stay until handled.
 
 ## How long a card stays
@@ -534,7 +535,9 @@ std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
         }
         return {};
     }
-    std::string wantTitle = ToUtf8(title), wantText = ToUtf8(text);
+    // Only the start of the message: the banner can show it with other line breaks or cut off (Firefox, Gmail).
+    std::wstring start = text.substr(0, std::min(text.find_first_of(L"\r\n"), (size_t)24));
+    std::string wantTitle = ToUtf8(title), wantText = ToUtf8(start);
     std::string payload, aumid;
     sqlite3_stmt* stmt = nullptr;
     if (g_sqlite.prepare_v2(db,
@@ -562,6 +565,38 @@ std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
     g_sqlite.close(db);
     // The download can take a moment, so it happens after the database is closed.
     return payload.empty() ? std::wstring() : AvatarFromPayload(payload, FromUtf8(aumid));
+}
+
+// The icon a desktop app registered for its notifications (HKCU\Software\Classes\AppUserModelId\<id>, IconUri),
+// found by the app name the banner shows. Used when the toast itself has no image or isn't in the database
+// (Firefox doesn't store its toasts there).
+std::wstring AppIcon(const std::wstring& app) {
+    HKEY root;
+    if (app.empty() || RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\AppUserModelId", 0, KEY_READ, &root) !=
+                           ERROR_SUCCESS) {
+        return {};
+    }
+    std::wstring icon;
+    WCHAR name[512];
+    for (DWORD i = 0; icon.empty(); i++) {
+        DWORD nameLength = ARRAYSIZE(name);
+        if (RegEnumKeyExW(root, i, name, &nameLength, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+            break;
+        }
+        WCHAR value[MAX_PATH];
+        DWORD size = sizeof(value);
+        if (RegGetValueW(root, name, L"DisplayName", RRF_RT_REG_SZ, nullptr, value, &size) != ERROR_SUCCESS ||
+            app != value) {
+            continue;
+        }
+        size = sizeof(value);
+        if (RegGetValueW(root, name, L"IconUri", RRF_RT_REG_SZ, nullptr, value, &size) == ERROR_SUCCESS &&
+            FileExists(value)) {
+            icon = value;
+        }
+    }
+    RegCloseKey(root);
+    return icon;
 }
 
 enum class Action { Open, Dismiss, Button, FocusInput };
@@ -904,6 +939,9 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                 if (info.image.rfind(L"http", 0) == 0) {
                                     StartAvatarDownload(info.id, info.image);
                                     info.image.clear();
+                                }
+                                if (info.image.empty()) {
+                                    info.image = AppIcon(info.app);
                                 }
                                 BSTR automationId = nullptr;
                                 element->get_CurrentAutomationId(&automationId);
