@@ -566,6 +566,10 @@ constexpr float kWidth = 360;  // window width in DIPs; cards are kWidth - 2 * k
 constexpr float kPad = 8;      // room around the stack (shadow) and gap between cards
 constexpr float kCardPadX = 12, kCardPadY = 10, kAvatar = 40, kGap = 10, kRadius = 12;
 constexpr float kFontSize = 13, kLine = kFontSize * 1.35f;
+// Longer messages make the card taller, up to this many lines; the rest is cut with an ellipsis.
+constexpr float kMaxLines = 4;
+// Everything is drawn 30% larger than Messy's toasts (sizes above are Messy's, in CSS pixels).
+constexpr float kZoom = 1.3f;
 constexpr DWORD kInMs = 280, kOutMs = 400;
 
 struct Card {
@@ -598,7 +602,7 @@ float Scale() {
     HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     UINT dpiX = 96, dpiY = 96;
     GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
-    return dpiX / 96.0f;
+    return dpiX / 96.0f * kZoom;
 }
 
 RECT WorkArea() {
@@ -656,11 +660,11 @@ void LayoutCard(Card& card) {
     std::wstring title = card.info.title.empty() ? card.info.app : card.info.title;
     g_dwrite->CreateTextLayout(title.c_str(), (UINT32)title.size(), g_titleFormat, textWidth, kLine, &card.title);
     g_dwrite->CreateTextLayout(card.info.text.c_str(), (UINT32)card.info.text.size(), g_textFormat, textWidth,
-                               2 * kLine, &card.text);
+                               kMaxLines * kLine, &card.text);
     DWRITE_TEXT_METRICS metrics{};
     float textHeight = 0;
     if (card.text && SUCCEEDED(card.text->GetMetrics(&metrics))) {
-        textHeight = std::min(metrics.height, 2 * kLine);
+        textHeight = std::min(metrics.height, kMaxLines * kLine);
     }
     card.height = std::max(kAvatar, kLine + textHeight) + 2 * kCardPadY;
     card.avatar = LoadBitmap(card.info.image);
@@ -809,7 +813,7 @@ bool Render() {
 
         float textLeft = rect.left + kCardPadX + kAvatar + kGap;
         DWRITE_TEXT_METRICS metrics{};
-        float textHeight = card.text && SUCCEEDED(card.text->GetMetrics(&metrics)) ? std::min(metrics.height, 2 * kLine) : 0;
+        float textHeight = card.text && SUCCEEDED(card.text->GetMetrics(&metrics)) ? std::min(metrics.height, kMaxLines * kLine) : 0;
         float textTop = rect.top + (card.height - kLine - textHeight) / 2;
         if (ID2D1SolidColorBrush* ink = Brush(0xe4e6eb, alpha)) {
             if (card.title) {
@@ -950,7 +954,7 @@ bool CreateResources() {
     if (!g_titleFormat || !g_textFormat || !g_letterFormat) {
         return false;
     }
-    // Name on one line, text on at most two, both cut with an ellipsis (text-overflow, -webkit-line-clamp).
+    // Name on one line, text on at most kMaxLines, both cut with an ellipsis (text-overflow, -webkit-line-clamp).
     DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
     for (IDWriteTextFormat* format : {g_titleFormat, g_textFormat}) {
         IDWriteInlineObject* ellipsis = nullptr;
