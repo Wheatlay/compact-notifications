@@ -28,8 +28,8 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
 * **Buttons** from the notification (for example *Reply*, *Snooze*, *Dismiss*) are shown under the text.
 * **Reply box**: click it and type, then press the app's send button. The text goes to the original reply
   box, so the app receives it as usual.
-* **Avatars**: the notification's image (local files, web images and images from Store apps); otherwise
-  the first letter of the app.
+* **Avatars**: the notification's image (local files, web images and images from Store apps), or a thumbnail of
+  its large picture (e.g. a screenshot); otherwise the first letter of the app.
 * **Priority notifications** (reminders, alarms, incoming calls) get a colored outline and stay until handled.
 
 ## How long a card stays
@@ -114,43 +114,105 @@ works as before. Turning the mod off brings the original banners back.
 #include <string>
 #include <vector>
 
-// Development log: besides Windhawk's log, lines go to %TEMP%\messy-toasts.log if that file exists
-// (create it to turn this on, delete it to turn it off).
-void FileLog(const wchar_t* format, ...) {
-    WCHAR path[MAX_PATH];
-    if (!GetTempPathW(ARRAYSIZE(path), path) || wcscat_s(path, L"messy-toasts.log") != 0 ||
-        GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
-        return;
-    }
-    WCHAR line[1024];
-    SYSTEMTIME now;
-    GetLocalTime(&now);
-    int prefix = swprintf(line, ARRAYSIZE(line), L"%02d:%02d:%02d.%03d %lu ", now.wHour, now.wMinute, now.wSecond,
-                          now.wMilliseconds, GetCurrentProcessId());
-    va_list args;
-    va_start(args, format);
-    vswprintf(line + prefix, ARRAYSIZE(line) - prefix - 2, format, args);
-    va_end(args);
-    wcscat_s(line, L"\n");
-    char utf8[4096];
-    int size = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof(utf8), nullptr, nullptr) - 1;
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
-                              nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        DWORD written;
-        WriteFile(file, utf8, size > 0 ? size : 0, &written, nullptr);
-        CloseHandle(file);
-    }
-}
+#ifndef Log
+#define Log(format, ...) Wh_Log(format, ##__VA_ARGS__)
+#endif
 
-#define Log(format, ...)                         \
-    do {                                         \
-        Wh_Log(format, ##__VA_ARGS__);           \
-        FileLog(format, ##__VA_ARGS__);          \
-    } while (0)
-
-// The banner window title (String resource \ActionCenter\AC_ToastCenter_Title). Only languages in use here.
-const wchar_t* const kBannerTitles[] = {L"Nowe powiadomienie", L"New notification", L"Neue Benachrichtigung"};
+// The banner window title in every Windows display language (String resource \ActionCenter\AC_ToastCenter_Title in
+// Windows.UI.ShellCommon.<locale>.pri). The list comes from the "Notifications placement" mod by m417z, which collected
+// it from https://github.com/m417z/windows-language-files.
+// clang-format off
+const wchar_t* const kBannerTitles[] = {
+    L"Nuwe kennisgewing", // AF-ZA
+    L"አዲስ ማሳወቂያ", // AM-ET
+    L"নতুন জাননী", // AS-IN
+    L"Yeni bildiriş", // AZ-LATN-AZ
+    L"Новае апавяшчэнне", // BE-BY
+    L"নতুন বিজ্ঞপ্তি", // BN-IN
+    L"Novo obavještenje", // BS-LATN-BA
+    L"Notificació nova", // CA-ES-VALENCIA
+    L"ᎢᏤᎢ ᎧᏃᎮᏓ", // CHR-CHER-US
+    L"Hysbysiad newydd", // CY-GB
+    L"اعلان جدید", // FA-IR
+    L"Bagong notification", // FIL-PH
+    L"Fógra nua", // GA-IE
+    L"Brath ùr", // GD-GB
+    L"નવી સૂચના", // GU-IN
+    L"नई अधिसूचना", // HI-IN
+    L"Նոր ծանուցում", // HY-AM
+    L"Ný tilkynning", // IS-IS
+    L"ახალი შეტყობინება", // KA-GE
+    L"Жаңа хабарландыру", // KK-KZ
+    L"ការ\u200bជូន\u200bដំណឹង\u200bថ្មី", // KM-KH
+    L"ಹೊಸ ಪ್ರಕಟಣೆ", // KN-IN
+    L"नवी अधिसुचोवणी", // KOK-IN
+    L"Nei Notifikatioun", // LB-LU
+    L"ການແຈ້ງເຕືອນໃໝ່", // LO-LA
+    L"Whakamōhiotanga hōu", // MI-NZ
+    L"Ново известување", // MK-MK
+    L"പുതിയ അറിയിപ്പ്", // ML-IN
+    L"नवीन सूचना", // MR-IN
+    L"Pemberitahuan baharu", // MS-MY
+    L"Notifika ġdida", // MT-MT
+    L"नयाँ सूचना", // NE-NP
+    L"Nytt varsel", // NN-NO
+    L"ନୂତନ ବିଜ୍ଞପ୍ତି", // OR-IN
+    L"ਨਵੀਂ ਸੂਚਨਾ", // PA-IN
+    L"Musuq willana", // QUZ-PE
+    L"Njoftim i ri", // SQ-AL
+    L"Ново обавјештење", // SR-CYRL-BA
+    L"Ново обавештење", // SR-CYRL-RS
+    L"புதிய அறிவிப்பு", // TA-IN
+    L"కొత్త నోటిఫికేషన్", // TE-IN
+    L"Яңа белдерү", // TT-RU
+    L"يېڭى ئۇقتۇرۇش", // UG-CN
+    L"نئی اطلاع", // UR-PK
+    L"Yangi xabarnoma", // UZ-LATN-UZ
+    L"\u200f\u200fإعلام جديد", // AR-SA
+    L"Ново известие", // BG-BG
+    L"Notificació nova", // CA-ES
+    L"Nové oznámení", // CS-CZ
+    L"Ny meddelelse", // DA-DK
+    L"Neue Benachrichtigung", // DE-DE
+    L"Νέα ειδοποίηση", // EL-GR
+    L"New notification", // EN-GB
+    L"New notification", // EN-US
+    L"Notificación nueva", // ES-ES
+    L"Nueva notificación", // ES-MX
+    L"Uus teatis", // ET-EE
+    L"Jakinarazpen berria", // EU-ES
+    L"Uusi ilmoitus", // FI-FI
+    L"Nouvelle notification", // FR-CA
+    L"Nouvelle notification", // FR-FR
+    L"Nova notificación", // GL-ES
+    L"הודעה חדשה", // HE-IL
+    L"Nova obavijesti", // HR-HR
+    L"Új értesítés", // HU-HU
+    L"Pemberitahuan baru", // ID-ID
+    L"Nuova notifica", // IT-IT
+    L"新しい通知", // JA-JP
+    L"새 알림", // KO-KR
+    L"Naujas pranešimas", // LT-LT
+    L"Jauns paziņojums", // LV-LV
+    L"Ny varsling", // NB-NO
+    L"Nieuwe melding", // NL-NL
+    L"Nowe powiadomienie", // PL-PL
+    L"Nova notificação", // PT-BR
+    L"Nova notificação", // PT-PT
+    L"Notificare nouă", // RO-RO
+    L"Новое уведомление", // RU-RU
+    L"Nové oznámenie", // SK-SK
+    L"Novo obvestilo", // SL-SI
+    L"Novo obaveštenje", // SR-LATN-RS
+    L"Nytt meddelande", // SV-SE
+    L"การแจ้งให้ทราบใหม่", // TH-TH
+    L"Yeni bildirim", // TR-TR
+    L"Нове сповіщення", // UK-UA
+    L"Thông báo mới", // VI-VN
+    L"新通知", // ZH-CN
+    L"新通知", // ZH-TW
+};
+// clang-format on
 
 bool IsBannerTitle(HWND hwnd) {
     WCHAR title[64];
@@ -396,14 +458,21 @@ std::wstring WithScale(const std::wstring& path) {
 
 // The avatar file from a toast payload: the appLogoOverride image as a local file. Web images are downloaded to
 // the internet cache; ms-appx and ms-appdata point into the app's package and data folders.
+// Without one, any other image (hero or inline) stands in, e.g. the screenshot Snipping Tool attaches.
+std::wstring ImageFromPayload(const std::string& payload, const std::wstring& aumid, bool logoOnly);
 std::wstring AvatarFromPayload(const std::string& payload, const std::wstring& aumid) {
+    std::wstring logo = ImageFromPayload(payload, aumid, true);
+    return logo.empty() ? ImageFromPayload(payload, aumid, false) : logo;
+}
+
+std::wstring ImageFromPayload(const std::string& payload, const std::wstring& aumid, bool logoOnly) {
     for (size_t at = 0; (at = payload.find("<image", at)) != std::string::npos; at++) {
         size_t end = payload.find('>', at);
         if (end == std::string::npos) {
             break;
         }
         std::string tag = payload.substr(at, end - at);
-        if (Attribute(tag, "placement") != "appLogoOverride") {
+        if ((Attribute(tag, "placement") == "appLogoOverride") != logoOnly) {
             continue;
         }
         std::wstring src = FromUtf8(XmlUnescape(Attribute(tag, "src")));
@@ -678,38 +747,6 @@ std::wstring ChildName(IUIAutomationElement* toast, IUIAutomationCondition* cond
     return result;
 }
 
-bool FileLogEnabled() {
-    WCHAR path[MAX_PATH];
-    return GetTempPathW(ARRAYSIZE(path), path) && wcscat_s(path, L"messy-toasts.log") == 0 &&
-           GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-}
-
-// Development: the UI Automation tree of a toast, into the file log.
-void DumpTree(IUIAutomationTreeWalker* walker, IUIAutomationElement* element, int depth) {
-    CONTROLTYPEID type = 0;
-    element->get_CurrentControlType(&type);
-    BSTR name = nullptr, id = nullptr, cls = nullptr;
-    element->get_CurrentName(&name);
-    element->get_CurrentAutomationId(&id);
-    element->get_CurrentClassName(&cls);
-    FileLog(L"%*s%d id=\"%s\" class=\"%s\" name=\"%s\"", depth * 2, L"", type, id ? id : L"", cls ? cls : L"",
-            name ? name : L"");
-    SysFreeString(name);
-    SysFreeString(id);
-    SysFreeString(cls);
-    if (depth >= 8) {
-        return;
-    }
-    IUIAutomationElement* child = nullptr;
-    walker->GetFirstChildElement(element, &child);
-    while (child) {
-        DumpTree(walker, child, depth + 1);
-        IUIAutomationElement* next = nullptr;
-        walker->GetNextSiblingElement(child, &next);
-        child->Release();
-        child = next;
-    }
-}
 
 void InvokeElement(IUIAutomationElement* element) {
     Com<IUIAutomationInvokePattern> invoke;
@@ -764,8 +801,6 @@ DWORD WINAPI WorkerThread(LPVOID) {
         };
         std::vector<Known> known;
         std::vector<ToastInfo> lastSent;
-        Com<IUIAutomationTreeWalker> walker;
-        uia->get_RawViewWalker(walker.put());
 
         auto findChildren = [](IUIAutomationElement* toast, IUIAutomationCondition* condition) {
             std::vector<IUIAutomationElement*> result;
@@ -886,9 +921,6 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                 info.hasInput = !edits.empty();
                                 release(edits);
                                 info.placeholder = ChildName(element, editCondition->p);
-                                if (walker && FileLogEnabled()) {
-                                    DumpTree(walker.p, element, 0);
-                                }
                                 Log(L"Toast %s: %s / %s [%s] %d buttons%s", info.app.c_str(), info.title.c_str(),
                                     info.text.c_str(), info.image.c_str(), (int)info.buttons.size(),
                                     info.hasInput ? L", reply box" : L"");

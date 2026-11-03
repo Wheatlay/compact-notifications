@@ -63,7 +63,7 @@ $flags = @('-std=c++23', '-O2', '-shared', '-DUNICODE', '-D_UNICODE', '-DWINVER=
 	'-D_WIN32_IE=0x0A00', '-DNTDDI_VERSION=0x0A000008', '-D__USE_MINGW_ANSI_STDIO=0', '-DWH_MOD',
 	# PowerShell 5.1 drops bare quotes inside native arguments, hence the backslashes.
 	('-DWH_MOD_ID=L\"local@' + $Id + '\"'), ('-DWH_MOD_VERSION=L\"' + $Version + '\"'),"$wh/$engine/64/windhawk.lib",
-	'-x', 'c++', $Source, '-include', 'windhawk_api.h', '-target', 'x86_64-w64-mingw32',
+	'-x', 'c++', $Source, '-include', 'windhawk_api.h', '-include', "$PSScriptRoot/devlog.h", '-target', 'x86_64-w64-mingw32',
 	'-Wl,--export-all-symbols', '-o', $out) + $options
 Push-Location "$wh/Compiler"
 & "$wh/Compiler/bin/clang++.exe" @flags
