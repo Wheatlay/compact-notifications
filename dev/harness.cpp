@@ -15,6 +15,15 @@ inline BOOL Wh_SetFunctionHook(void*, void*, void**) {
     return TRUE;
 }
 
+// No settings outside Windhawk: the mod keeps its built-in defaults (LoadSettings isn't called).
+inline int Wh_GetIntSetting(PCWSTR, ...) {
+    return 0;
+}
+inline PCWSTR Wh_GetStringSetting(PCWSTR, ...) {
+    return L"";
+}
+inline void Wh_FreeStringSetting(PCWSTR) {}
+
 #include MOD_SOURCE
 
 int wmain(int argc, wchar_t** argv) {

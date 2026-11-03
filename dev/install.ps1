@@ -16,11 +16,29 @@ if ($Dll) {
 	$text = Get-Content $Source -Raw
 	$include = ([regex]::Matches($text, '(?m)^// @include\s+(\S+)') | ForEach-Object { $_.Groups[1].Value }) -join '|'
 	$key = "HKLM:/SOFTWARE/Windhawk/Engine/Mods/local@$Id"
-	New-Item $key -Force | Out-Null
+	# New-Item -Force would recreate an existing key and wipe its values (settings included).
+	if (-not (Test-Path $key)) { New-Item $key | Out-Null }
 	Set-ItemProperty $key Version $Version
 	Set-ItemProperty $key Include $include
 	Set-ItemProperty $key Disabled 0 -Type DWord
 	Set-ItemProperty $key LoggingEnabled 1 -Type DWord
+	# Default settings, like the editor writes them on compile (only the ones not set yet). Groups become
+	# "group.name" values; true/false and numbers are DWORDs, the rest strings.
+	$settings = [regex]::Match($text, '(?s)// ==WindhawkModSettings==\s*/\*(.*?)\*/').Groups[1].Value
+	$settingsKey = "$key/Settings"
+	if (-not (Test-Path $settingsKey)) { New-Item $settingsKey | Out-Null }
+	$group = ''
+	foreach ($line in $settings -split "`r?`n") {
+		if ($line -match '^- (\w+):\s*$') { $group = $Matches[1] + '.'; continue }
+		if ($line -match '^- (\w+):\s*(.+)$') { $group = ''; $name = $Matches[1]; $value = $Matches[2] }
+		elseif ($line -match '^  - (\w+):\s*(.+)$' -and $group) { $name = $group + $Matches[1]; $value = $Matches[2] }
+		else { continue }
+		if ($null -ne (Get-ItemProperty $settingsKey -Name $name -ErrorAction SilentlyContinue)) { continue }
+		$value = $value.Trim().Trim('"')
+		if ($value -eq 'true' -or $value -eq 'false') { Set-ItemProperty $settingsKey $name ([int]($value -eq 'true')) -Type DWord }
+		elseif ($value -match '^-?\d+$') { Set-ItemProperty $settingsKey $name ([int]$value) -Type DWord }
+		else { Set-ItemProperty $settingsKey $name $value -Type String }
+	}
 	# The engine reloads the mod when LibraryFileName changes, so that goes last.
 	Set-ItemProperty $key SettingsChangeTime ([int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Type DWord
 	Set-ItemProperty $key LibraryFileName (Split-Path $Dll -Leaf)

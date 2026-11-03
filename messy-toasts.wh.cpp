@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              messy-toasts
 // @name            Messy toasts
-// @description     Replaces Windows toast banners with compact dark cards in the style of Messy
-// @version         0.1
+// @description     Replaces Windows notification banners with compact cards in the style of the Messy app
+// @version         0.2
 // @author          Wheatlay
 // @github          https://github.com/Wheatlay
 // @include         ShellExperienceHost.exe
@@ -18,14 +18,82 @@
 /*
 # Messy toasts
 
-Windows still creates its own toast banner, but the mod moves it off the screen and shows its own card instead.
-Clicking the card does what clicking the banner would do; the × on hover closes it (it stays in the notification
-center). A card lives exactly as long as the hidden banner: the time is set in Settings > Accessibility >
-Visual effects > Dismiss notifications after this amount of time.
+Replaces Windows toast banners with compact cards in the style of the Messy app: black (or white) rounded
+cards with a round avatar, the sender in bold and up to a few lines of text, sliding in from the screen edge.
 
-Avatars come from the toast's appLogoOverride image when it is a local file. Not yet: web and app-package images, buttons and reply boxes (use the notification center for those).
+## What works
+
+* **Click** a card to do what clicking the original notification does (open the app or the conversation).
+* **×** (on hover) closes the card; the notification stays in the notification center.
+* **Buttons** from the notification (for example *Reply*, *Snooze*, *Dismiss*) are shown under the text.
+* **Reply box**: click it and type, then press the app's send button. The text goes to the original reply
+  box, so the app receives it as usual.
+* **Avatars**: the notification's image (local files, web images and images from Store apps); otherwise
+  the first letter of the app.
+* **Priority notifications** (reminders, alarms, incoming calls) get a colored outline and stay until handled.
+
+## How long a card stays
+
+A card stays exactly as long as the original notification would. Windows sets this time in
+*Settings > Accessibility > Visual effects > Dismiss notifications after this amount of time*.
+
+## How it works
+
+Windows still creates its own banner, but the mod moves it off the screen and reads it (UI Automation and
+the notification database). Clicks and typing on a card go to the hidden banner, so every app action
+works as before. Turning the mod off brings the original banners back.
+
+## Limitations
+
+* Text styles, progress bars and large (hero) images are not shown.
+* While a full-screen app or *Do not disturb* is on, Windows doesn't show notifications at all, so there are
+  no cards either.
 */
 // ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- appearance:
+  - theme: auto
+    $name: Theme
+    $options:
+    - auto: Follow Windows (black in dark mode, white in light mode)
+    - dark: Always black
+    - light: Always white
+  - size: 130
+    $name: Size (%)
+    $description: 100 is the size of Messy's own toasts. From 80 to 200.
+  - maxLines: 4
+    $name: Lines of text
+    $description: Longer messages make the card taller up to this many lines; the rest is cut off with "…". From 1 to 10.
+  $name: Appearance
+- position:
+  - monitor: cursor
+    $name: Monitor
+    $options:
+    - cursor: The one with the mouse pointer
+    - primary: The primary monitor
+  - corner: bottomRight
+    $name: Corner
+    $options:
+    - bottomRight: Bottom right
+    - topRight: Top right
+    - bottomLeft: Bottom left
+    - topLeft: Top left
+  $name: Position
+- behavior:
+  - showActions: true
+    $name: Show buttons and reply boxes
+    $description: When off, cards only show the text; use the notification center to reply.
+  - highlightPriority: true
+    $name: Highlight priority notifications
+    $description: Colored outline for reminders, alarms and incoming calls.
+  - priorityColor: "#F0A020"
+    $name: Priority color
+    $description: Hex color, for example #F0A020 (orange) or #E0102F (red).
+  $name: Behavior
+*/
+// ==/WindhawkModSettings==
 
 #include <windows.h>
 #include <d2d1.h>
@@ -450,6 +518,7 @@ DWORD g_uiThreadId = 0;
 HWND g_window = nullptr;
 
 constexpr UINT WM_APP_SNAPSHOT = WM_APP + 1;
+constexpr UINT WM_APP_SETTINGS = WM_APP + 2;
 constexpr DWORD kPollMs = 100;
 
 HWND FindVisibleBanner() {
@@ -801,12 +870,56 @@ constexpr float kPad = 8;      // room around the stack (shadow) and gap between
 constexpr float kCardPadX = 12, kCardPadY = 10, kAvatar = 40, kGap = 10, kRadius = 12;
 constexpr float kFontSize = 13, kLine = kFontSize * 1.35f;
 constexpr float kFieldHeight = 28, kRowGap = 8, kFieldRadius = 7, kButtonGap = 6;
-// Longer messages make the card taller, up to this many lines; the rest is cut with an ellipsis.
-constexpr float kMaxLines = 4;
-// Everything is drawn 30% larger than Messy's toasts (sizes above are Messy's, in CSS pixels).
-constexpr float kZoom = 1.3f;
 constexpr DWORD kInMs = 280, kOutMs = 400;
-constexpr UINT32 kPriorityColor = 0xF0A020;  // reminders, alarms, calls
+
+// Mod settings (WindhawkModSettings). Sizes above are Messy's, in CSS pixels; "size" scales all of them.
+enum class ThemeChoice { Auto, Dark, Light };
+struct Settings {
+    ThemeChoice theme = ThemeChoice::Auto;
+    float zoom = 1.3f;
+    float maxLines = 4;  // longer messages make the card taller up to this; the rest is cut with an ellipsis
+    bool cursorMonitor = true;
+    bool top = false, left = false;  // corner
+    bool showActions = true;
+    bool highlightPriority = true;
+    UINT32 priorityColor = 0xF0A020;  // reminders, alarms, calls
+} g_settings;
+
+std::wstring StringSetting(const wchar_t* name) {
+    PCWSTR value = Wh_GetStringSetting(name);
+    std::wstring result = value ? value : L"";
+    Wh_FreeStringSetting(value);
+    return result;
+}
+
+void LoadSettings() {
+    Settings s;
+    std::wstring theme = StringSetting(L"appearance.theme");
+    s.theme = theme == L"dark" ? ThemeChoice::Dark : theme == L"light" ? ThemeChoice::Light : ThemeChoice::Auto;
+    if (int size = Wh_GetIntSetting(L"appearance.size")) {
+        s.zoom = std::clamp(size, 80, 200) / 100.0f;
+    }
+    if (int lines = Wh_GetIntSetting(L"appearance.maxLines")) {
+        s.maxLines = (float)std::clamp(lines, 1, 10);
+    }
+    s.cursorMonitor = StringSetting(L"position.monitor") != L"primary";
+    std::wstring corner = StringSetting(L"position.corner");
+    s.top = corner.rfind(L"top", 0) == 0;
+    s.left = corner.find(L"Left") != std::wstring::npos;
+    s.showActions = Wh_GetIntSetting(L"behavior.showActions") != 0;
+    s.highlightPriority = Wh_GetIntSetting(L"behavior.highlightPriority") != 0;
+    std::wstring color = StringSetting(L"behavior.priorityColor");
+    if (!color.empty() && color[0] == L'#') {
+        color.erase(0, 1);
+    }
+    if (color.size() == 6 && color.find_first_not_of(L"0123456789abcdefABCDEF") == std::wstring::npos) {
+        s.priorityColor = wcstoul(color.c_str(), nullptr, 16);
+    }
+    g_settings = s;
+    Log(L"Settings: theme %d, size %d%%, %d lines, %s monitor, corner %s%s, actions %d, priority %d #%06X", (int)s.theme,
+        (int)(s.zoom * 100 + 0.5f), (int)s.maxLines, s.cursorMonitor ? L"cursor" : L"primary", s.top ? L"top" : L"bottom",
+        s.left ? L"Left" : L"Right", s.showActions, s.highlightPriority, s.priorityColor);
+}
 
 // Black cards in dark mode (like Messy's OLED mode), white ones in light mode.
 struct Theme {
@@ -869,7 +982,7 @@ HMONITOR Monitor() {
 float Scale() {
     UINT dpiX = 96, dpiY = 96;
     GetDpiForMonitor(Monitor(), MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
-    return dpiX / 96.0f * kZoom;
+    return dpiX / 96.0f * g_settings.zoom;
 }
 
 RECT WorkArea() {
@@ -923,11 +1036,11 @@ void LayoutCard(Card& card) {
     std::wstring title = card.info.title.empty() ? card.info.app : card.info.title;
     g_dwrite->CreateTextLayout(title.c_str(), (UINT32)title.size(), g_titleFormat, textWidth, kLine, &card.title);
     g_dwrite->CreateTextLayout(card.info.text.c_str(), (UINT32)card.info.text.size(), g_textFormat, textWidth,
-                               kMaxLines * kLine, &card.text);
+                               g_settings.maxLines * kLine, &card.text);
     DWRITE_TEXT_METRICS metrics{};
     float textHeight = 0;
     if (card.text && SUCCEEDED(card.text->GetMetrics(&metrics))) {
-        textHeight = std::min(metrics.height, kMaxLines * kLine);
+        textHeight = std::min(metrics.height, g_settings.maxLines * kLine);
     }
     card.contentHeight = std::max(kAvatar, kLine + textHeight);
     card.height = card.contentHeight + 2 * kCardPadY;
@@ -979,11 +1092,18 @@ void ApplySnapshot() {
             if (std::all_of(g_cards.begin(), g_cards.end(), [](const Card& c) { return c.goneAt; })) {
                 POINT cursor{};
                 GetCursorPos(&cursor);
-                g_monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
-                g_theme = SystemUsesLightTheme() ? kLight : kDark;
+                g_monitor = g_settings.cursorMonitor ? MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY) : nullptr;
+                bool light = g_settings.theme == ThemeChoice::Light ||
+                             (g_settings.theme == ThemeChoice::Auto && SystemUsesLightTheme());
+                g_theme = light ? kLight : kDark;
             }
             Card card;
             card.info = info;
+            if (!g_settings.showActions) {
+                card.info.buttons.clear();
+                card.info.hasInput = false;
+            }
+            card.info.priority = card.info.priority && g_settings.highlightPriority;
             card.shownAt = now;
             LayoutCard(card);
             g_cards.push_back(card);
@@ -1042,9 +1162,9 @@ void DrawCard(Card& card, int index, float x, float alpha) {
     FillRounded(rect, kRadius, hovered && g_hover.part == Part::Body ? theme.cardHover : theme.card, alpha);
     if (card.info.priority) {
         // Reminders, alarms and calls: accent outline and a bar along the left edge.
-        StrokeRounded(rect, kRadius, kPriorityColor, alpha, 1.5f);
+        StrokeRounded(rect, kRadius, g_settings.priorityColor, alpha, 1.5f);
         FillRounded(D2D1_RECT_F{rect.left + 4, rect.top + kRadius, rect.left + 7, rect.bottom - kRadius}, 1.5f,
-                    kPriorityColor, alpha);
+                    g_settings.priorityColor, alpha);
     } else {
         StrokeRounded(rect, kRadius, theme.border, theme.borderAlpha * alpha, 1);
     }
@@ -1067,7 +1187,7 @@ void DrawCard(Card& card, int index, float x, float alpha) {
         g_target->FillEllipse(&circle, avatarBrush);
         avatarBrush->Release();
     } else {
-        if (ID2D1SolidColorBrush* fill = Brush(card.info.priority ? kPriorityColor : 0x808080, 0.3f * alpha)) {
+        if (ID2D1SolidColorBrush* fill = Brush(card.info.priority ? g_settings.priorityColor : 0x808080, 0.3f * alpha)) {
             g_target->FillEllipse(&circle, fill);
             fill->Release();
         }
@@ -1081,7 +1201,7 @@ void DrawCard(Card& card, int index, float x, float alpha) {
 
     float textLeft = rect.left + kCardPadX + kAvatar + kGap;
     DWRITE_TEXT_METRICS metrics{};
-    float textHeight = card.text && SUCCEEDED(card.text->GetMetrics(&metrics)) ? std::min(metrics.height, kMaxLines * kLine) : 0;
+    float textHeight = card.text && SUCCEEDED(card.text->GetMetrics(&metrics)) ? std::min(metrics.height, g_settings.maxLines * kLine) : 0;
     float textTop = rect.top + kCardPadY + (card.contentHeight - kLine - textHeight) / 2;
     if (ID2D1SolidColorBrush* ink = Brush(theme.ink, alpha)) {
         if (card.title) {
@@ -1102,7 +1222,7 @@ void DrawCard(Card& card, int index, float x, float alpha) {
         bool over = hovered && g_hover.part == Part::Input;
         FillRounded(box, kFieldRadius, over || card.info.inputFocused ? theme.fieldHover : theme.field, alpha);
         if (card.info.inputFocused) {
-            StrokeRounded(box, kFieldRadius, card.info.priority ? kPriorityColor : 0x0866ff, alpha, 1.5f);
+            StrokeRounded(box, kFieldRadius, card.info.priority ? g_settings.priorityColor : 0x0866ff, alpha, 1.5f);
         }
         D2D1_RECT_F textBox{box.left + 10, box.top, box.right - 10, box.bottom};
         bool empty = card.info.inputValue.empty();
@@ -1196,19 +1316,22 @@ bool Render() {
     bool animating = false;
     float cardWidth = kWidth - 2 * kPad;
     float y = kPad;
-    for (size_t i = 0; i < g_cards.size(); i++) {
+    // Newest card next to the screen edge: at the bottom in bottom corners, at the top in top corners.
+    for (size_t n = 0; n < g_cards.size(); n++) {
+        size_t i = g_settings.top ? g_cards.size() - 1 - n : n;
         Card& card = g_cards[i];
         card.top = y;
         float in = EaseOut((now - card.shownAt) / (float)kInMs);
         float alpha = card.goneAt ? 1 - std::clamp((now - card.goneAt) / (float)kOutMs, 0.0f, 1.0f) : 1.0f;
         animating |= in < 1 || card.goneAt;
-        DrawCard(card, (int)i, kPad + (1 - in) * cardWidth * 1.1f, alpha);
+        float slide = (1 - in) * cardWidth * 1.1f;
+        DrawCard(card, (int)i, kPad + (g_settings.left ? -slide : slide), alpha);
         y += card.height + kPad;
     }
     g_target->EndDraw();
 
     RECT work = WorkArea();
-    POINT dst{work.right - size.cx, work.bottom - size.cy};
+    POINT dst{g_settings.left ? work.left : work.right - size.cx, g_settings.top ? work.top : work.bottom - size.cy};
     POINT src{0, 0};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     UpdateLayeredWindow(g_window, nullptr, &dst, &size, g_memDC, &src, 0, &blend, ULW_ALPHA);
@@ -1270,6 +1393,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             Redraw();
             return 0;
         case WM_TIMER:
+            Redraw();
+            return 0;
+        case WM_APP_SETTINGS:
+            // Size and lines change the layout of the cards already shown.
+            LoadSettings();
+            for (auto& card : g_cards) {
+                ReleaseCard(card);
+                card.title = card.text = nullptr;
+                card.avatar = nullptr;
+                LayoutCard(card);
+            }
             Redraw();
             return 0;
         case WM_MOUSEACTIVATE:
@@ -1345,7 +1479,7 @@ bool CreateResources() {
     if (!g_titleFormat || !g_textFormat || !g_letterFormat || !g_buttonFormat || !g_fieldFormat) {
         return false;
     }
-    // Name on one line, text on at most kMaxLines, both cut with an ellipsis (text-overflow, -webkit-line-clamp).
+    // Name on one line, text on at most maxLines lines, both cut with an ellipsis (text-overflow, -webkit-line-clamp).
     DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
     for (IDWriteTextFormat* f : {g_titleFormat, g_textFormat, g_buttonFormat, g_fieldFormat}) {
         IDWriteInlineObject* ellipsis = nullptr;
@@ -1487,12 +1621,17 @@ BOOL Wh_ModInit() {
 
 void Wh_ModAfterInit() {
     HideExistingBanner();
+    LoadSettings();
     if (g_role == Role::ShellWithCards && !WhTool_ModInit()) {
         Log(L"Starting the cards failed");
     }
 }
 
-void Wh_ModSettingsChanged() {}
+void Wh_ModSettingsChanged() {
+    if (g_window) {
+        PostMessage(g_window, WM_APP_SETTINGS, 0, 0);
+    }
+}
 
 void Wh_ModUninit() {
     if (g_role == Role::ShellWithCards) {
