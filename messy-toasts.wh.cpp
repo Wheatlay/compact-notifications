@@ -7,7 +7,7 @@
 // @github          https://github.com/Wheatlay
 // @include         ShellExperienceHost.exe
 // @include         explorer.exe
-// @compilerOptions -lole32 -loleaut32 -ldwmapi -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs
+// @compilerOptions -lole32 -loleaut32 -ldwmapi -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs -ladvapi32 -lurlmon
 // ==/WindhawkMod==
 
 // The tool-mod boilerplate and the banner detection idea come from the "Toast auto-dismiss" mod by nikitor32 (GPL-3.0),
@@ -34,6 +34,8 @@ Avatars come from the toast's appLogoOverride image when it is a local file. Not
 #include <shellscalingapi.h>
 #include <uiautomation.h>
 #include <wincodec.h>
+#include <appmodel.h>
+#include <urlmon.h>
 
 #include <wchar.h>
 
@@ -172,11 +174,18 @@ void HideExistingBanner() {
 // Reading: a worker thread finds the banner and reads its toasts through UI Automation.
 
 struct ToastInfo {
-    std::wstring id;  // UIA runtime id
+    // App, title and text (plus a counter for identical toasts). UIA runtime ids change while the banner lives.
+    std::wstring id;
     std::wstring app;
     std::wstring title;
     std::wstring text;
     std::wstring image;  // local file of the avatar (appLogoOverride), empty if none
+    std::vector<std::wstring> buttons;
+    bool hasInput = false;
+    std::wstring placeholder;
+    std::wstring inputValue;  // what has been typed into the (hidden) banner's reply box
+    bool inputFocused = false;
+    bool priority = false;  // reminders, alarms, calls: they stay until handled
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -271,8 +280,54 @@ std::string Attribute(const std::string& tag, const char* name) {
     return end == std::string::npos ? std::string() : tag.substr(at, end - at);
 }
 
-// The avatar file from a toast payload: the appLogoOverride image as a local path (file:/// URL or plain path).
-std::wstring AvatarFromPayload(const std::string& payload) {
+bool FileExists(const std::wstring& path) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Install folder of a Store app from its package family name (the part of the AUMID before "!").
+std::wstring PackagePath(const std::wstring& family) {
+    UINT32 count = 0, bufferLength = 0;
+    if (GetPackagesByPackageFamily(family.c_str(), &count, nullptr, &bufferLength, nullptr) != ERROR_INSUFFICIENT_BUFFER ||
+        !count) {
+        return {};
+    }
+    std::vector<PWSTR> names(count);
+    std::vector<WCHAR> buffer(bufferLength);
+    if (GetPackagesByPackageFamily(family.c_str(), &count, names.data(), &bufferLength, buffer.data()) != ERROR_SUCCESS) {
+        return {};
+    }
+    UINT32 length = 0;
+    GetPackagePathByFullName(names[0], &length, nullptr);
+    std::wstring path(length, L'\0');
+    if (!length || GetPackagePathByFullName(names[0], &length, path.data()) != ERROR_SUCCESS) {
+        return {};
+    }
+    path.resize(wcslen(path.c_str()));
+    return path;
+}
+
+// Store apps ship images in several scales (logo.scale-200.png) and refer to them without one (logo.png).
+std::wstring WithScale(const std::wstring& path) {
+    if (FileExists(path)) {
+        return path;
+    }
+    size_t dot = path.rfind(L'.');
+    if (dot == std::wstring::npos) {
+        return {};
+    }
+    for (const wchar_t* scale : {L".scale-200", L".scale-150", L".scale-125", L".scale-100", L".scale-400"}) {
+        std::wstring candidate = path.substr(0, dot) + scale + path.substr(dot);
+        if (FileExists(candidate)) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+// The avatar file from a toast payload: the appLogoOverride image as a local file. Web images are downloaded to
+// the internet cache; ms-appx and ms-appdata point into the app's package and data folders.
+std::wstring AvatarFromPayload(const std::string& payload, const std::wstring& aumid) {
     for (size_t at = 0; (at = payload.find("<image", at)) != std::string::npos; at++) {
         size_t end = payload.find('>', at);
         if (end == std::string::npos) {
@@ -282,14 +337,48 @@ std::wstring AvatarFromPayload(const std::string& payload) {
         if (Attribute(tag, "placement") != "appLogoOverride") {
             continue;
         }
-        std::string src = XmlUnescape(Attribute(tag, "src"));
-        if (src.rfind("file:///", 0) == 0) {
-            src = PercentDecode(src.substr(8));
-        } else if (src.size() < 3 || src[1] != ':') {
-            return {};  // ms-appx, ms-appdata and web images aren't supported yet
+        std::wstring src = FromUtf8(XmlUnescape(Attribute(tag, "src")));
+        std::wstring family = aumid.substr(0, aumid.find(L'!'));
+        auto after = [&](const wchar_t* prefix) {
+            std::wstring rest = FromUtf8(PercentDecode(ToUtf8(src.substr(wcslen(prefix)))));
+            std::replace(rest.begin(), rest.end(), L'/', L'\\');
+            return rest;
+        };
+        auto starts = [&](const wchar_t* prefix) { return _wcsnicmp(src.c_str(), prefix, wcslen(prefix)) == 0; };
+        if (starts(L"http://") || starts(L"https://")) {
+            WCHAR file[MAX_PATH];
+            if (SUCCEEDED(URLDownloadToCacheFileW(nullptr, src.c_str(), file, ARRAYSIZE(file), 0, nullptr))) {
+                return file;
+            }
+            Log(L"Downloading the avatar failed: %s", src.c_str());
+            return {};
         }
-        std::replace(src.begin(), src.end(), '/', '\\');
-        return FromUtf8(src);
+        if (starts(L"ms-appx:///")) {
+            std::wstring root = PackagePath(family);
+            return root.empty() ? std::wstring() : WithScale(root + L"\\" + after(L"ms-appx:///"));
+        }
+        if (starts(L"ms-appdata:///")) {
+            // ms-appdata:///local/x.png -> %LOCALAPPDATA%\Packages\<family>\LocalState\x.png (also roaming, temp).
+            std::wstring rest = after(L"ms-appdata:///");
+            const std::pair<const wchar_t*, const wchar_t*> folders[] = {
+                {L"local\\", L"LocalState\\"}, {L"roaming\\", L"RoamingState\\"}, {L"temp\\", L"TempState\\"}};
+            WCHAR localAppData[MAX_PATH];
+            if (!GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData))) {
+                return {};
+            }
+            for (auto [from, to] : folders) {
+                if (_wcsnicmp(rest.c_str(), from, wcslen(from)) == 0) {
+                    return WithScale(std::wstring(localAppData) + L"\\Packages\\" + family + L"\\" + to +
+                                     rest.substr(wcslen(from)));
+                }
+            }
+            return {};
+        }
+        if (starts(L"file:///")) {
+            return after(L"file:///");
+        }
+        std::replace(src.begin(), src.end(), L'/', L'\\');
+        return src.size() > 2 && src[1] == L':' ? src : std::wstring();
     }
     return {};
 }
@@ -313,10 +402,11 @@ std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
         return {};
     }
     std::string wantTitle = ToUtf8(title), wantText = ToUtf8(text);
-    std::wstring result;
+    std::string payload, aumid;
     sqlite3_stmt* stmt = nullptr;
     if (g_sqlite.prepare_v2(db,
-                            "SELECT Payload FROM Notification WHERE Type = 'toast' ORDER BY ArrivalTime DESC LIMIT 30",
+                            "SELECT n.Payload, h.PrimaryId FROM Notification n JOIN NotificationHandler h "
+                            "ON h.RecordId = n.HandlerId WHERE n.Type = 'toast' ORDER BY n.ArrivalTime DESC LIMIT 30",
                             -1, &stmt, nullptr) == 0) {
         while (g_sqlite.step(stmt) == SQLITE_ROW) {
             auto data = (const char*)g_sqlite.column_blob(stmt, 0);
@@ -324,24 +414,34 @@ std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
             if (!data || size <= 0) {
                 continue;
             }
-            std::string payload(data, size);
-            std::string plain = XmlUnescape(payload);
+            std::string candidate(data, size);
+            std::string plain = XmlUnescape(candidate);
             if (plain.find(wantTitle) != std::string::npos && plain.find(wantText) != std::string::npos) {
-                result = AvatarFromPayload(payload);
+                payload = candidate;
+                if (auto id = (const char*)g_sqlite.column_blob(stmt, 1)) {
+                    aumid.assign(id, g_sqlite.column_bytes(stmt, 1));
+                }
                 break;
             }
         }
         g_sqlite.finalize(stmt);
     }
     g_sqlite.close(db);
-    return result;
+    // The download can take a moment, so it happens after the database is closed.
+    return payload.empty() ? std::wstring() : AvatarFromPayload(payload, FromUtf8(aumid));
 }
 
-enum class Action { Open, Dismiss };
+enum class Action { Open, Dismiss, Button, FocusInput };
+
+struct Command {
+    std::wstring id;
+    Action action;
+    int index = 0;  // which button
+};
 
 std::mutex g_mutex;
-std::vector<ToastInfo> g_snapshot;                       // guarded by g_mutex
-std::vector<std::pair<std::wstring, Action>> g_commands;  // guarded by g_mutex
+std::vector<ToastInfo> g_snapshot;  // guarded by g_mutex
+std::vector<Command> g_commands;    // guarded by g_mutex
 
 HANDLE g_stopEvent = nullptr;
 HANDLE g_workerThread = nullptr;
@@ -430,6 +530,39 @@ std::wstring ChildName(IUIAutomationElement* toast, IUIAutomationCondition* cond
     return result;
 }
 
+bool FileLogEnabled() {
+    WCHAR path[MAX_PATH];
+    return GetTempPathW(ARRAYSIZE(path), path) && wcscat_s(path, L"messy-toasts.log") == 0 &&
+           GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Development: the UI Automation tree of a toast, into the file log.
+void DumpTree(IUIAutomationTreeWalker* walker, IUIAutomationElement* element, int depth) {
+    CONTROLTYPEID type = 0;
+    element->get_CurrentControlType(&type);
+    BSTR name = nullptr, id = nullptr, cls = nullptr;
+    element->get_CurrentName(&name);
+    element->get_CurrentAutomationId(&id);
+    element->get_CurrentClassName(&cls);
+    FileLog(L"%*s%d id=\"%s\" class=\"%s\" name=\"%s\"", depth * 2, L"", type, id ? id : L"", cls ? cls : L"",
+            name ? name : L"");
+    SysFreeString(name);
+    SysFreeString(id);
+    SysFreeString(cls);
+    if (depth >= 8) {
+        return;
+    }
+    IUIAutomationElement* child = nullptr;
+    walker->GetFirstChildElement(element, &child);
+    while (child) {
+        DumpTree(walker, child, depth + 1);
+        IUIAutomationElement* next = nullptr;
+        walker->GetNextSiblingElement(child, &next);
+        child->Release();
+        child = next;
+    }
+}
+
 void InvokeElement(IUIAutomationElement* element) {
     Com<IUIAutomationInvokePattern> invoke;
     if (SUCCEEDED(element->GetCurrentPatternAs(UIA_InvokePatternId, __uuidof(IUIAutomationInvokePattern),
@@ -451,6 +584,14 @@ DWORD WINAPI WorkerThread(LPVOID) {
             CoUninitialize();
             return 0;
         }
+        // The banner's process can stall; without limits a call could hang and block unloading the mod.
+        {
+            Com<IUIAutomation2> uia2;
+            if (SUCCEEDED(uia->QueryInterface(__uuidof(IUIAutomation2), reinterpret_cast<void**>(uia2.put())))) {
+                uia2->put_ConnectionTimeout(1000);
+                uia2->put_TransactionTimeout(1000);
+            }
+        }
         Com<IUIAutomationCondition> toastCondition;
         {
             VARIANT v{};
@@ -463,35 +604,72 @@ DWORD WINAPI WorkerThread(LPVOID) {
         Com<IUIAutomationCondition>* titleCondition = NewIdCondition(uia.p, L"Title");
         Com<IUIAutomationCondition>* textCondition = NewIdCondition(uia.p, L"MessageText");
         Com<IUIAutomationCondition>* dismissCondition = NewIdCondition(uia.p, L"DismissButton");
+        Com<IUIAutomationCondition>* verbCondition = NewIdCondition(uia.p, L"VerbButton");
+        Com<IUIAutomationCondition>* editCondition = NewIdCondition(uia.p, L"Edit");
 
-        // Toasts already read: their texts don't change, and the element is needed to click or dismiss them.
+        // Toasts on the banner. The element is needed to click, dismiss or type; runtimeId only saves re-reading
+        // the texts while it stays the same.
         struct Known {
             ToastInfo info;
+            std::wstring runtimeId;
             IUIAutomationElement* element;
         };
         std::vector<Known> known;
         std::vector<ToastInfo> lastSent;
+        Com<IUIAutomationTreeWalker> walker;
+        uia->get_RawViewWalker(walker.put());
+
+        auto findChildren = [](IUIAutomationElement* toast, IUIAutomationCondition* condition) {
+            std::vector<IUIAutomationElement*> result;
+            Com<IUIAutomationElementArray> array;
+            if (condition && SUCCEEDED(toast->FindAll(TreeScope_Descendants, condition, array.put())) && array) {
+                int count = 0;
+                array->get_Length(&count);
+                for (int i = 0; i < count; i++) {
+                    IUIAutomationElement* element = nullptr;
+                    if (SUCCEEDED(array->GetElement(i, &element)) && element) {
+                        result.push_back(element);
+                    }
+                }
+            }
+            return result;
+        };
+        auto release = [](std::vector<IUIAutomationElement*>& elements) {
+            for (auto element : elements) {
+                element->Release();
+            }
+        };
 
         while (WaitForSingleObject(g_stopEvent, kPollMs) == WAIT_TIMEOUT) {
-            std::vector<std::pair<std::wstring, Action>> commands;
+            std::vector<Command> commands;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 commands.swap(g_commands);
             }
-            for (auto& [id, action] : commands) {
+            for (auto& command : commands) {
                 for (auto& k : known) {
-                    if (k.info.id != id) {
+                    if (k.info.id != command.id) {
                         continue;
                     }
-                    if (action == Action::Open) {
+                    IUIAutomationCondition* condition = command.action == Action::Dismiss  ? dismissCondition->p
+                                                        : command.action == Action::Button ? verbCondition->p
+                                                        : command.action == Action::FocusInput ? editCondition->p
+                                                                                               : nullptr;
+                    if (!condition) {
                         InvokeElement(k.element);
-                    } else {
-                        Com<IUIAutomationElement> button;
-                        if (SUCCEEDED(k.element->FindFirst(TreeScope_Descendants, dismissCondition->p, button.put())) &&
-                            button) {
-                            InvokeElement(button.p);
+                        continue;
+                    }
+                    auto targets = findChildren(k.element, condition);
+                    int index = command.action == Action::Button ? command.index : 0;
+                    if (index < (int)targets.size()) {
+                        if (command.action == Action::FocusInput) {
+                            // Typing then goes straight to the hidden banner's reply box; the card shows its text.
+                            targets[index]->SetFocus();
+                        } else {
+                            InvokeElement(targets[index]);
                         }
                     }
+                    release(targets);
                 }
             }
 
@@ -508,18 +686,71 @@ DWORD WINAPI WorkerThread(LPVOID) {
                         if (FAILED(toasts->GetElement(i, &element)) || !element) {
                             continue;
                         }
-                        std::wstring id = RuntimeId(element);
-                        auto old = std::find_if(known.begin(), known.end(), [&](const Known& k) { return k.info.id == id; });
-                        if (old != known.end()) {
-                            current.push_back({old->info, element});
-                            continue;
+                        std::wstring runtimeId = RuntimeId(element);
+                        auto same = std::find_if(known.begin(), known.end(),
+                                                 [&](const Known& k) { return k.runtimeId == runtimeId; });
+                        ToastInfo info;
+                        if (same != known.end()) {
+                            info = same->info;
+                        } else {
+                            info.app = ChildName(element, senderCondition->p);
+                            info.title = ChildName(element, titleCondition->p);
+                            info.text = ChildName(element, textCondition->p);
+                            std::wstring key = info.app + L"\n" + info.title + L"\n" + info.text + L"#";
+                            int n = (int)std::count_if(current.begin(), current.end(), [&](const Known& k) {
+                                return k.info.id.rfind(key, 0) == 0;
+                            });
+                            info.id = key + std::to_wstring(n);
+                            auto old = std::find_if(known.begin(), known.end(),
+                                                    [&](const Known& k) { return k.info.id == info.id; });
+                            if (old != known.end()) {
+                                info = old->info;
+                            } else {
+                                info.image = FindAvatar(info.title, info.text);
+                                BSTR automationId = nullptr;
+                                element->get_CurrentAutomationId(&automationId);
+                                info.priority = automationId && wcsncmp(automationId, L"PriorityToastView", 17) == 0;
+                                SysFreeString(automationId);
+                                auto buttons = findChildren(element, verbCondition->p);
+                                for (auto button : buttons) {
+                                    BSTR name = nullptr;
+                                    button->get_CurrentName(&name);
+                                    info.buttons.push_back(name ? name : L"");
+                                    SysFreeString(name);
+                                }
+                                release(buttons);
+                                auto edits = findChildren(element, editCondition->p);
+                                info.hasInput = !edits.empty();
+                                release(edits);
+                                info.placeholder = ChildName(element, editCondition->p);
+                                if (walker && FileLogEnabled()) {
+                                    DumpTree(walker.p, element, 0);
+                                }
+                                Log(L"Toast %s: %s / %s [%s] %d buttons%s", info.app.c_str(), info.title.c_str(),
+                                    info.text.c_str(), info.image.c_str(), (int)info.buttons.size(),
+                                    info.hasInput ? L", reply box" : L"");
+                            }
                         }
-                        ToastInfo info{id, ChildName(element, senderCondition->p), ChildName(element, titleCondition->p),
-                                       ChildName(element, textCondition->p)};
-                        info.image = FindAvatar(info.title, info.text);
-                        Log(L"Toast %s: %s / %s [%s]", info.app.c_str(), info.title.c_str(), info.text.c_str(),
-                               info.image.c_str());
-                        current.push_back({info, element});
+                        // The reply box changes while typing: its text and focus are read on every pass.
+                        if (info.hasInput) {
+                            auto edits = findChildren(element, editCondition->p);
+                            if (!edits.empty()) {
+                                Com<IUIAutomationValuePattern> value;
+                                BSTR text = nullptr;
+                                if (SUCCEEDED(edits[0]->GetCurrentPatternAs(UIA_ValuePatternId,
+                                                                            __uuidof(IUIAutomationValuePattern),
+                                                                            reinterpret_cast<void**>(value.put()))) &&
+                                    value && SUCCEEDED(value->get_CurrentValue(&text))) {
+                                    info.inputValue = text ? text : L"";
+                                    SysFreeString(text);
+                                }
+                                BOOL focused = FALSE;
+                                edits[0]->get_CurrentHasKeyboardFocus(&focused);
+                                info.inputFocused = focused != FALSE;
+                            }
+                            release(edits);
+                        }
+                        current.push_back({info, runtimeId, element});
                     }
                 }
             }
@@ -533,8 +764,9 @@ DWORD WINAPI WorkerThread(LPVOID) {
                 infos.push_back(k.info);
             }
             bool changed = infos.size() != lastSent.size() ||
-                           !std::equal(infos.begin(), infos.end(), lastSent.begin(),
-                                       [](const ToastInfo& a, const ToastInfo& b) { return a.id == b.id; });
+                           !std::equal(infos.begin(), infos.end(), lastSent.begin(), [](const ToastInfo& a, const ToastInfo& b) {
+                               return a.id == b.id && a.inputValue == b.inputValue && a.inputFocused == b.inputFocused;
+                           });
             if (changed) {
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
@@ -553,30 +785,59 @@ DWORD WINAPI WorkerThread(LPVOID) {
         delete titleCondition;
         delete textCondition;
         delete dismissCondition;
+        delete verbCondition;
+        delete editCondition;
     }
     CoUninitialize();
     return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Drawing: one layered, never-activated window in the bottom right corner with a stack of cards (page/toast.html
-// in Messy): newest at the bottom, slides in from the right, fades out.
+// Drawing: one layered, never-activated window in a bottom corner with a stack of cards (page/toast.html in Messy):
+// newest at the bottom, slides in from the right, fades out. Buttons and the reply box sit under the text.
 
 constexpr float kWidth = 360;  // window width in DIPs; cards are kWidth - 2 * kPad wide
 constexpr float kPad = 8;      // room around the stack (shadow) and gap between cards
 constexpr float kCardPadX = 12, kCardPadY = 10, kAvatar = 40, kGap = 10, kRadius = 12;
 constexpr float kFontSize = 13, kLine = kFontSize * 1.35f;
+constexpr float kFieldHeight = 28, kRowGap = 8, kFieldRadius = 7, kButtonGap = 6;
 // Longer messages make the card taller, up to this many lines; the rest is cut with an ellipsis.
 constexpr float kMaxLines = 4;
 // Everything is drawn 30% larger than Messy's toasts (sizes above are Messy's, in CSS pixels).
 constexpr float kZoom = 1.3f;
 constexpr DWORD kInMs = 280, kOutMs = 400;
+constexpr UINT32 kPriorityColor = 0xF0A020;  // reminders, alarms, calls
+
+// Black cards in dark mode (like Messy's OLED mode), white ones in light mode.
+struct Theme {
+    UINT32 card, cardHover, border, ink, field, fieldHover;
+    float borderAlpha;
+};
+constexpr Theme kDark{0x000000, 0x121212, 0x3a3b3c, 0xe4e6eb, 0x1c1c1d, 0x2a2b2c, 0.9f};
+constexpr Theme kLight{0xffffff, 0xf2f2f2, 0x808080, 0x050505, 0xf0f2f5, 0xe4e6eb, 0.25f};
+
+bool SystemUsesLightTheme() {
+    DWORD value = 0, size = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                        L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS &&
+           value != 0;
+}
+
+enum class Part { None, Body, Close, Button, Input };
+
+struct Hit {
+    int card = -1;
+    Part part = Part::None;
+    int index = 0;
+    bool operator==(const Hit&) const = default;
+};
 
 struct Card {
     ToastInfo info;
     IDWriteTextLayout* title = nullptr;
     IDWriteTextLayout* text = nullptr;
     ID2D1Bitmap* avatar = nullptr;
+    float contentHeight = 0;  // avatar and texts, without buttons and the reply box
     float height = 0;
     ULONGLONG shownAt = 0;
     ULONGLONG goneAt = 0;  // 0 while the system banner still has the toast
@@ -584,8 +845,9 @@ struct Card {
 };
 
 std::vector<Card> g_cards;
-int g_hovered = -1;
-bool g_hoverClose = false;
+Hit g_hover;
+Theme g_theme = kDark;
+HMONITOR g_monitor = nullptr;  // where the current stack is shown
 
 ID2D1Factory* g_d2d = nullptr;
 IDWriteFactory* g_dwrite = nullptr;
@@ -593,21 +855,26 @@ IWICImagingFactory* g_wic = nullptr;
 IDWriteTextFormat* g_titleFormat = nullptr;
 IDWriteTextFormat* g_textFormat = nullptr;
 IDWriteTextFormat* g_letterFormat = nullptr;
+IDWriteTextFormat* g_buttonFormat = nullptr;  // centered, one line
+IDWriteTextFormat* g_fieldFormat = nullptr;   // reply box: left, vertically centered, one line
 ID2D1DCRenderTarget* g_target = nullptr;
 HDC g_memDC = nullptr;
 HBITMAP g_bitmap = nullptr;
 SIZE g_bitmapSize{};
 
+HMONITOR Monitor() {
+    return g_monitor ? g_monitor : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
 float Scale() {
-    HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     UINT dpiX = 96, dpiY = 96;
-    GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+    GetDpiForMonitor(Monitor(), MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
     return dpiX / 96.0f * kZoom;
 }
 
 RECT WorkArea() {
     MONITORINFO mi{sizeof(mi)};
-    GetMonitorInfo(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+    GetMonitorInfo(Monitor(), &mi);
     return mi.rcWork;
 }
 
@@ -617,14 +884,10 @@ float EaseOut(float t) {
 }
 
 void ReleaseCard(Card& card) {
-    if (card.title) {
-        card.title->Release();
-    }
-    if (card.text) {
-        card.text->Release();
-    }
-    if (card.avatar) {
-        card.avatar->Release();
+    for (IUnknown* object : std::initializer_list<IUnknown*>{card.title, card.text, card.avatar}) {
+        if (object) {
+            object->Release();
+        }
     }
 }
 
@@ -666,8 +929,29 @@ void LayoutCard(Card& card) {
     if (card.text && SUCCEEDED(card.text->GetMetrics(&metrics))) {
         textHeight = std::min(metrics.height, kMaxLines * kLine);
     }
-    card.height = std::max(kAvatar, kLine + textHeight) + 2 * kCardPadY;
+    card.contentHeight = std::max(kAvatar, kLine + textHeight);
+    card.height = card.contentHeight + 2 * kCardPadY;
+    if (card.info.hasInput) {
+        card.height += kRowGap + kFieldHeight;
+    }
+    if (!card.info.buttons.empty()) {
+        card.height += kRowGap + kFieldHeight;
+    }
     card.avatar = LoadBitmap(card.info.image);
+}
+
+// Rows under the text, in card coordinates (left edge 0): the reply box, then the buttons side by side.
+D2D1_RECT_F InputRect(const Card& card) {
+    float top = kCardPadY + card.contentHeight + kRowGap;
+    return {kCardPadX, top, kWidth - 2 * kPad - kCardPadX, top + kFieldHeight};
+}
+
+D2D1_RECT_F ButtonRect(const Card& card, int index) {
+    float top = kCardPadY + card.contentHeight + kRowGap + (card.info.hasInput ? kFieldHeight + kRowGap : 0);
+    int count = (int)card.info.buttons.size();
+    float width = (kWidth - 2 * kPad - 2 * kCardPadX - (count - 1) * kButtonGap) / count;
+    float left = kCardPadX + index * (width + kButtonGap);
+    return {left, top, left + width, top + kFieldHeight};
 }
 
 void ApplySnapshot() {
@@ -678,14 +962,26 @@ void ApplySnapshot() {
     }
     ULONGLONG now = GetTickCount64();
     for (auto& card : g_cards) {
-        bool alive = std::any_of(snapshot.begin(), snapshot.end(), [&](const ToastInfo& t) { return t.id == card.info.id; });
-        if (!alive && !card.goneAt) {
-            card.goneAt = now;
+        auto live = std::find_if(snapshot.begin(), snapshot.end(), [&](const ToastInfo& t) { return t.id == card.info.id; });
+        if (live == snapshot.end()) {
+            if (!card.goneAt) {
+                card.goneAt = now;
+            }
+        } else {
+            card.info.inputValue = live->inputValue;
+            card.info.inputFocused = live->inputFocused;
         }
     }
     for (auto& info : snapshot) {
         bool have = std::any_of(g_cards.begin(), g_cards.end(), [&](const Card& c) { return c.info.id == info.id; });
         if (!have) {
+            // A new stack follows the cursor's monitor and the current theme; a growing one stays where it is.
+            if (std::all_of(g_cards.begin(), g_cards.end(), [](const Card& c) { return c.goneAt; })) {
+                POINT cursor{};
+                GetCursorPos(&cursor);
+                g_monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+                g_theme = SystemUsesLightTheme() ? kLight : kDark;
+            }
             Card card;
             card.info = info;
             card.shownAt = now;
@@ -710,6 +1006,151 @@ void FillRounded(D2D1_RECT_F rect, float radius, UINT32 rgb, float alpha) {
     }
 }
 
+void StrokeRounded(D2D1_RECT_F rect, float radius, UINT32 rgb, float alpha, float width) {
+    if (ID2D1SolidColorBrush* brush = Brush(rgb, alpha)) {
+        D2D1_RECT_F inner{rect.left + width / 2, rect.top + width / 2, rect.right - width / 2, rect.bottom - width / 2};
+        D2D1_ROUNDED_RECT rounded{inner, radius, radius};
+        g_target->DrawRoundedRectangle(&rounded, brush, width);
+        brush->Release();
+    }
+}
+
+void DrawString(const std::wstring& text, IDWriteTextFormat* format, D2D1_RECT_F box, UINT32 rgb, float alpha) {
+    if (ID2D1SolidColorBrush* ink = Brush(rgb, alpha)) {
+        g_target->DrawText(text.c_str(), (UINT32)text.size(), format, &box, ink, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        ink->Release();
+    }
+}
+
+D2D1_RECT_F Offset(D2D1_RECT_F rect, float x, float y) {
+    return {rect.left + x, rect.top + y, rect.right + x, rect.bottom + y};
+}
+
+void DrawCard(Card& card, int index, float x, float alpha) {
+    const Theme& theme = g_theme;
+    float cardWidth = kWidth - 2 * kPad;
+    D2D1_RECT_F rect{x, card.top, x + cardWidth, card.top + card.height};
+    bool live = !card.goneAt;
+    bool hovered = live && g_hover.card == index;
+
+    // Soft shadow: a few widening, fading layers (box-shadow: 0 4px 14px rgba(0,0,0,.35)).
+    for (int layer = 4; layer >= 1; layer--) {
+        float grow = layer * 2.0f;
+        FillRounded(D2D1_RECT_F{rect.left - grow, rect.top - grow + 4, rect.right + grow, rect.bottom + grow + 4},
+                    kRadius + grow, 0x000000, 0.06f * alpha);
+    }
+    FillRounded(rect, kRadius, hovered && g_hover.part == Part::Body ? theme.cardHover : theme.card, alpha);
+    if (card.info.priority) {
+        // Reminders, alarms and calls: accent outline and a bar along the left edge.
+        StrokeRounded(rect, kRadius, kPriorityColor, alpha, 1.5f);
+        FillRounded(D2D1_RECT_F{rect.left + 4, rect.top + kRadius, rect.left + 7, rect.bottom - kRadius}, 1.5f,
+                    kPriorityColor, alpha);
+    } else {
+        StrokeRounded(rect, kRadius, theme.border, theme.borderAlpha * alpha, 1);
+    }
+
+    // Avatar: the toast's image cropped to a circle (object-fit: cover), otherwise the app's first letter.
+    float cx = rect.left + kCardPadX + kAvatar / 2, cy = rect.top + kCardPadY + card.contentHeight / 2;
+    ID2D1BitmapBrush* avatarBrush = nullptr;
+    if (card.avatar) {
+        D2D1_SIZE_F size = card.avatar->GetSize();
+        float fit = kAvatar / std::min(size.width, size.height);
+        D2D1_BITMAP_BRUSH_PROPERTIES brushProps{D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR};
+        D2D1_BRUSH_PROPERTIES common{alpha, D2D1::Matrix3x2F::Scale(fit, fit) *
+                                                D2D1::Matrix3x2F::Translation(cx - size.width * fit / 2,
+                                                                              cy - size.height * fit / 2)};
+        g_target->CreateBitmapBrush(card.avatar, &brushProps, &common, &avatarBrush);
+    }
+    D2D1_ELLIPSE circle{{cx, cy}, kAvatar / 2, kAvatar / 2};
+    if (avatarBrush) {
+        g_target->FillEllipse(&circle, avatarBrush);
+        avatarBrush->Release();
+    } else {
+        if (ID2D1SolidColorBrush* fill = Brush(card.info.priority ? kPriorityColor : 0x808080, 0.3f * alpha)) {
+            g_target->FillEllipse(&circle, fill);
+            fill->Release();
+        }
+        std::wstring source = card.info.app.empty() ? card.info.title : card.info.app;
+        if (!source.empty()) {
+            std::wstring letter(1, (wchar_t)towupper(source[0]));
+            DrawString(letter, g_letterFormat, {cx - kAvatar / 2, cy - kAvatar / 2, cx + kAvatar / 2, cy + kAvatar / 2},
+                       theme.ink, alpha);
+        }
+    }
+
+    float textLeft = rect.left + kCardPadX + kAvatar + kGap;
+    DWRITE_TEXT_METRICS metrics{};
+    float textHeight = card.text && SUCCEEDED(card.text->GetMetrics(&metrics)) ? std::min(metrics.height, kMaxLines * kLine) : 0;
+    float textTop = rect.top + kCardPadY + (card.contentHeight - kLine - textHeight) / 2;
+    if (ID2D1SolidColorBrush* ink = Brush(theme.ink, alpha)) {
+        if (card.title) {
+            g_target->DrawTextLayout(D2D1_POINT_2F{textLeft, textTop}, card.title, ink, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        ink->Release();
+    }
+    if (ID2D1SolidColorBrush* ink = Brush(theme.ink, 0.8f * alpha)) {
+        if (card.text) {
+            g_target->DrawTextLayout(D2D1_POINT_2F{textLeft, textTop + kLine}, card.text, ink, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        ink->Release();
+    }
+
+    // Reply box: shows what is typed into the hidden banner's box, with a caret while it has the keyboard.
+    if (card.info.hasInput) {
+        D2D1_RECT_F box = Offset(InputRect(card), rect.left, rect.top);
+        bool over = hovered && g_hover.part == Part::Input;
+        FillRounded(box, kFieldRadius, over || card.info.inputFocused ? theme.fieldHover : theme.field, alpha);
+        if (card.info.inputFocused) {
+            StrokeRounded(box, kFieldRadius, card.info.priority ? kPriorityColor : 0x0866ff, alpha, 1.5f);
+        }
+        D2D1_RECT_F textBox{box.left + 10, box.top, box.right - 10, box.bottom};
+        bool empty = card.info.inputValue.empty();
+        DrawString(empty ? card.info.placeholder : card.info.inputValue, g_fieldFormat, textBox, theme.ink,
+                   (empty ? 0.5f : 1.0f) * alpha);
+        if (card.info.inputFocused) {
+            float caretX = textBox.left;
+            IDWriteTextLayout* layout = nullptr;
+            if (!empty && SUCCEEDED(g_dwrite->CreateTextLayout(card.info.inputValue.c_str(),
+                                                              (UINT32)card.info.inputValue.size(), g_fieldFormat,
+                                                              10000, kFieldHeight, &layout))) {
+                DWRITE_TEXT_METRICS m{};
+                layout->GetMetrics(&m);
+                caretX = std::min(textBox.left + m.widthIncludingTrailingWhitespace + 1, textBox.right);
+                layout->Release();
+            }
+            if (ID2D1SolidColorBrush* ink = Brush(theme.ink, alpha)) {
+                g_target->DrawLine({caretX, box.top + 7}, {caretX, box.bottom - 7}, ink, 1);
+                ink->Release();
+            }
+        }
+    }
+
+    for (int i = 0; i < (int)card.info.buttons.size(); i++) {
+        D2D1_RECT_F button = Offset(ButtonRect(card, i), rect.left, rect.top);
+        bool over = hovered && g_hover.part == Part::Button && g_hover.index == i;
+        FillRounded(button, kFieldRadius, over ? theme.fieldHover : theme.field, alpha);
+        DrawString(card.info.buttons[i], g_buttonFormat, button, theme.ink, alpha);
+    }
+
+    // Close button on hover, top right.
+    if (hovered) {
+        float bx = rect.right - 14, by = rect.top + 14;
+        if (g_hover.part == Part::Close) {
+            if (ID2D1SolidColorBrush* fill = Brush(0x808080, 0.3f)) {
+                D2D1_ELLIPSE closeCircle{{bx, by}, 10, 10};
+                g_target->FillEllipse(&closeCircle, fill);
+                fill->Release();
+            }
+        }
+        if (ID2D1SolidColorBrush* ink = Brush(theme.ink, 0.8f)) {
+            g_target->DrawLine({bx - 4, by - 4}, {bx + 4, by + 4}, ink, 1.4f);
+            g_target->DrawLine({bx + 4, by - 4}, {bx - 4, by + 4}, ink, 1.4f);
+            ink->Release();
+        }
+    }
+}
+
 // Returns whether anything is still animating.
 bool Render() {
     ULONGLONG now = GetTickCount64();
@@ -724,7 +1165,7 @@ bool Render() {
                   g_cards.end());
     if (g_cards.empty()) {
         ShowWindow(g_window, SW_HIDE);
-        g_hovered = -1;
+        g_hover = {};
         return false;
     }
 
@@ -761,90 +1202,7 @@ bool Render() {
         float in = EaseOut((now - card.shownAt) / (float)kInMs);
         float alpha = card.goneAt ? 1 - std::clamp((now - card.goneAt) / (float)kOutMs, 0.0f, 1.0f) : 1.0f;
         animating |= in < 1 || card.goneAt;
-        float x = kPad + (1 - in) * cardWidth * 1.1f;
-        D2D1_RECT_F rect{x, y, x + cardWidth, y + card.height};
-        bool hovered = (int)i == g_hovered && !card.goneAt;
-
-        // Soft shadow: a few widening, fading layers (box-shadow: 0 4px 14px rgba(0,0,0,.35)).
-        for (int layer = 4; layer >= 1; layer--) {
-            float grow = layer * 2.0f;
-            FillRounded(D2D1_RECT_F{rect.left - grow, rect.top - grow + 4, rect.right + grow, rect.bottom + grow + 4},
-                        kRadius + grow, 0x000000, 0.06f * alpha);
-        }
-        FillRounded(rect, kRadius, hovered ? 0x292a2b : 0x242526, alpha);
-        if (ID2D1SolidColorBrush* border = Brush(0x808080, 0.25f * alpha)) {
-            D2D1_RECT_F inner{rect.left + 0.5f, rect.top + 0.5f, rect.right - 0.5f, rect.bottom - 0.5f};
-            D2D1_ROUNDED_RECT rounded{inner, kRadius, kRadius};
-            g_target->DrawRoundedRectangle(&rounded, border, 1);
-            border->Release();
-        }
-
-        // Avatar: the toast's image cropped to a circle (object-fit: cover), otherwise the app's first letter.
-        float cx = rect.left + kCardPadX + kAvatar / 2, cy = rect.top + card.height / 2;
-        ID2D1BitmapBrush* avatarBrush = nullptr;
-        if (card.avatar) {
-            D2D1_SIZE_F size = card.avatar->GetSize();
-            float fit = kAvatar / std::min(size.width, size.height);
-            D2D1_BITMAP_BRUSH_PROPERTIES brushProps{D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
-                                                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR};
-            D2D1_BRUSH_PROPERTIES common{alpha, D2D1::Matrix3x2F::Scale(fit, fit) *
-                                                    D2D1::Matrix3x2F::Translation(cx - size.width * fit / 2,
-                                                                                  cy - size.height * fit / 2)};
-            g_target->CreateBitmapBrush(card.avatar, &brushProps, &common, &avatarBrush);
-        }
-        if (avatarBrush) {
-            D2D1_ELLIPSE circle{{cx, cy}, kAvatar / 2, kAvatar / 2};
-            g_target->FillEllipse(&circle, avatarBrush);
-            avatarBrush->Release();
-        } else if (ID2D1SolidColorBrush* fill = Brush(0x808080, 0.3f * alpha)) {
-            D2D1_ELLIPSE circle{{cx, cy}, kAvatar / 2, kAvatar / 2};
-            g_target->FillEllipse(&circle, fill);
-            fill->Release();
-        }
-        std::wstring source = card.info.app.empty() ? card.info.title : card.info.app;
-        if (!card.avatar && !source.empty()) {
-            wchar_t letter[2] = {(wchar_t)towupper(source[0]), 0};
-            if (ID2D1SolidColorBrush* ink = Brush(0xe4e6eb, alpha)) {
-                D2D1_RECT_F box{cx - kAvatar / 2, cy - kAvatar / 2, cx + kAvatar / 2, cy + kAvatar / 2};
-                g_target->DrawText(letter, 1, g_letterFormat, &box, ink);
-                ink->Release();
-            }
-        }
-
-        float textLeft = rect.left + kCardPadX + kAvatar + kGap;
-        DWRITE_TEXT_METRICS metrics{};
-        float textHeight = card.text && SUCCEEDED(card.text->GetMetrics(&metrics)) ? std::min(metrics.height, kMaxLines * kLine) : 0;
-        float textTop = rect.top + (card.height - kLine - textHeight) / 2;
-        if (ID2D1SolidColorBrush* ink = Brush(0xe4e6eb, alpha)) {
-            if (card.title) {
-                g_target->DrawTextLayout(D2D1_POINT_2F{textLeft, textTop}, card.title, ink, D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            }
-            ink->Release();
-        }
-        if (ID2D1SolidColorBrush* ink = Brush(0xe4e6eb, 0.8f * alpha)) {
-            if (card.text) {
-                g_target->DrawTextLayout(D2D1_POINT_2F{textLeft, textTop + kLine}, card.text, ink,
-                                         D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            }
-            ink->Release();
-        }
-
-        // Close button on hover, top right.
-        if (hovered) {
-            float bx = rect.right - 14, by = rect.top + 14;
-            if (g_hoverClose) {
-                if (ID2D1SolidColorBrush* fill = Brush(0x808080, 0.3f)) {
-                    D2D1_ELLIPSE circle{{bx, by}, 10, 10};
-                    g_target->FillEllipse(&circle, fill);
-                    fill->Release();
-                }
-            }
-            if (ID2D1SolidColorBrush* ink = Brush(0xe4e6eb, 0.8f)) {
-                g_target->DrawLine({bx - 4, by - 4}, {bx + 4, by + 4}, ink, 1.4f);
-                g_target->DrawLine({bx + 4, by - 4}, {bx - 4, by + 4}, ink, 1.4f);
-                ink->Release();
-            }
-        }
+        DrawCard(card, (int)i, kPad + (1 - in) * cardWidth * 1.1f, alpha);
         y += card.height + kPad;
     }
     g_target->EndDraw();
@@ -869,25 +1227,40 @@ void Redraw() {
     }
 }
 
-// Which card (and whether its close button) is under a point in window pixels.
-int HitTest(POINT pt, bool* onClose) {
+bool Inside(D2D1_RECT_F rect, float x, float y) {
+    return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+}
+
+// What is under a point in window pixels.
+Hit HitTest(POINT pt) {
     float scale = Scale();
     float x = pt.x / scale, y = pt.y / scale;
     for (size_t i = 0; i < g_cards.size(); i++) {
         const Card& card = g_cards[i];
-        if (!card.goneAt && x >= kPad && x < kWidth - kPad && y >= card.top && y < card.top + card.height) {
-            float bx = kWidth - kPad - 14, by = card.top + 14;
-            *onClose = (x - bx) * (x - bx) + (y - by) * (y - by) <= 12 * 12;
-            return (int)i;
+        if (card.goneAt || x < kPad || x >= kWidth - kPad || y < card.top || y >= card.top + card.height) {
+            continue;
         }
+        float cardX = x - kPad, cardY = y - card.top;
+        float bx = kWidth - 2 * kPad - 14, by = 14;
+        if ((cardX - bx) * (cardX - bx) + (cardY - by) * (cardY - by) <= 12 * 12) {
+            return {(int)i, Part::Close};
+        }
+        if (card.info.hasInput && Inside(InputRect(card), cardX, cardY)) {
+            return {(int)i, Part::Input};
+        }
+        for (int b = 0; b < (int)card.info.buttons.size(); b++) {
+            if (Inside(ButtonRect(card, b), cardX, cardY)) {
+                return {(int)i, Part::Button, b};
+            }
+        }
+        return {(int)i, Part::Body};
     }
-    *onClose = false;
-    return -1;
+    return {};
 }
 
-void SendCommand(const std::wstring& id, Action action) {
+void SendCommand(const std::wstring& id, Action action, int index = 0) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_commands.push_back({id, action});
+    g_commands.push_back({id, action, index});
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -902,11 +1275,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
         case WM_MOUSEMOVE: {
-            bool onClose = false;
-            int hovered = HitTest(POINT{(short)LOWORD(lParam), (short)HIWORD(lParam)}, &onClose);
-            if (hovered != g_hovered || onClose != g_hoverClose) {
-                g_hovered = hovered;
-                g_hoverClose = onClose;
+            Hit hit = HitTest(POINT{(short)LOWORD(lParam), (short)HIWORD(lParam)});
+            if (!(hit == g_hover)) {
+                g_hover = hit;
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
                 TrackMouseEvent(&tme);
                 Redraw();
@@ -914,24 +1285,41 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case WM_MOUSELEAVE:
-            g_hovered = -1;
-            g_hoverClose = false;
+            g_hover = {};
             Redraw();
             return 0;
         case WM_LBUTTONUP: {
-            bool onClose = false;
-            int index = HitTest(POINT{(short)LOWORD(lParam), (short)HIWORD(lParam)}, &onClose);
-            if (index >= 0) {
-                Card& card = g_cards[index];
-                SendCommand(card.info.id, onClose ? Action::Dismiss : Action::Open);
-                card.goneAt = GetTickCount64();
-                Redraw();
+            Hit hit = HitTest(POINT{(short)LOWORD(lParam), (short)HIWORD(lParam)});
+            if (hit.card < 0) {
+                return 0;
             }
+            Card& card = g_cards[hit.card];
+            switch (hit.part) {
+                case Part::Body:
+                case Part::Close:
+                    SendCommand(card.info.id, hit.part == Part::Body ? Action::Open : Action::Dismiss);
+                    card.goneAt = GetTickCount64();
+                    break;
+                case Part::Button:
+                    // The card goes when the banner drops the toast (a "snooze" may keep it).
+                    SendCommand(card.info.id, Action::Button, hit.index);
+                    break;
+                case Part::Input:
+                    SendCommand(card.info.id, Action::FocusInput);
+                    break;
+                case Part::None:
+                    break;
+            }
+            Redraw();
             return 0;
         }
-        case WM_SETCURSOR:
-            SetCursor(LoadCursor(nullptr, IDC_HAND));
+        case WM_SETCURSOR: {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            SetCursor(LoadCursor(nullptr, HitTest(pt).part == Part::Input ? IDC_IBEAM : IDC_HAND));
             return TRUE;
+        }
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
@@ -945,28 +1333,38 @@ bool CreateResources() {
     }
     // Without WIC the cards just show letters instead of avatars.
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic));
-    g_dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
-                               DWRITE_FONT_STRETCH_NORMAL, kFontSize, L"", &g_titleFormat);
-    g_dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                               DWRITE_FONT_STRETCH_NORMAL, kFontSize, L"", &g_textFormat);
-    g_dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
-                               DWRITE_FONT_STRETCH_NORMAL, 17, L"", &g_letterFormat);
-    if (!g_titleFormat || !g_textFormat || !g_letterFormat) {
+    auto format = [](DWRITE_FONT_WEIGHT weight, float size, IDWriteTextFormat** out) {
+        g_dwrite->CreateTextFormat(L"Segoe UI", nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                   size, L"", out);
+    };
+    format(DWRITE_FONT_WEIGHT_SEMI_BOLD, kFontSize, &g_titleFormat);
+    format(DWRITE_FONT_WEIGHT_NORMAL, kFontSize, &g_textFormat);
+    format(DWRITE_FONT_WEIGHT_SEMI_BOLD, 17, &g_letterFormat);
+    format(DWRITE_FONT_WEIGHT_SEMI_BOLD, kFontSize, &g_buttonFormat);
+    format(DWRITE_FONT_WEIGHT_NORMAL, kFontSize, &g_fieldFormat);
+    if (!g_titleFormat || !g_textFormat || !g_letterFormat || !g_buttonFormat || !g_fieldFormat) {
         return false;
     }
     // Name on one line, text on at most kMaxLines, both cut with an ellipsis (text-overflow, -webkit-line-clamp).
     DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
-    for (IDWriteTextFormat* format : {g_titleFormat, g_textFormat}) {
+    for (IDWriteTextFormat* f : {g_titleFormat, g_textFormat, g_buttonFormat, g_fieldFormat}) {
         IDWriteInlineObject* ellipsis = nullptr;
-        g_dwrite->CreateEllipsisTrimmingSign(format, &ellipsis);
-        format->SetTrimming(&trimming, ellipsis);
+        g_dwrite->CreateEllipsisTrimmingSign(f, &ellipsis);
+        f->SetTrimming(&trimming, ellipsis);
         if (ellipsis) {
             ellipsis->Release();
         }
-        format->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, kLine, kLine * 0.8f);
+    }
+    for (IDWriteTextFormat* f : {g_titleFormat, g_textFormat}) {
+        f->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, kLine, kLine * 0.8f);
     }
     g_titleFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     g_textFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
+    for (IDWriteTextFormat* f : {g_buttonFormat, g_fieldFormat}) {
+        f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    g_buttonFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     g_letterFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     g_letterFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
@@ -995,8 +1393,8 @@ void ReleaseResources() {
     if (g_memDC) {
         DeleteDC(g_memDC);
     }
-    for (IUnknown* object : std::initializer_list<IUnknown*>{g_target, g_letterFormat, g_textFormat, g_titleFormat,
-                                                             g_dwrite, g_wic, g_d2d}) {
+    for (IUnknown* object : std::initializer_list<IUnknown*>{g_target, g_fieldFormat, g_buttonFormat, g_letterFormat,
+                                                             g_textFormat, g_titleFormat, g_dwrite, g_wic, g_d2d}) {
         if (object) {
             object->Release();
         }
@@ -1040,9 +1438,14 @@ void WhTool_ModSettingsChanged() {}
 
 void WhTool_ModUninit() {
     SetEvent(g_stopEvent);
-    WaitForSingleObject(g_workerThread, INFINITE);
+    // The card window goes first, so nothing frozen stays on the screen even if the worker is stuck.
     PostThreadMessage(g_uiThreadId, WM_QUIT, 0, 0);
-    WaitForSingleObject(g_uiThread, INFINITE);
+    if (WaitForSingleObject(g_uiThread, 3000) != WAIT_OBJECT_0) {
+        Log(L"The card thread didn't stop");
+    }
+    if (WaitForSingleObject(g_workerThread, 5000) != WAIT_OBJECT_0) {
+        Log(L"The reading thread didn't stop");
+    }
 }
 
 
