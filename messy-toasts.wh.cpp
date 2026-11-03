@@ -8,7 +8,7 @@
 // @include         ShellExperienceHost.exe
 // @include         explorer.exe
 // @include         windhawk.exe
-// @compilerOptions -lole32 -loleaut32 -ldwmapi -ld2d1 -ldwrite -lshcore -lgdi32
+// @compilerOptions -lole32 -loleaut32 -ldwmapi -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs
 // ==/WindhawkMod==
 
 // The tool-mod boilerplate and the banner detection idea come from the "Toast auto-dismiss" mod by nikitor32 (GPL-3.0),
@@ -24,7 +24,7 @@ Clicking the card does what clicking the banner would do; the × on hover closes
 center). A card lives exactly as long as the hidden banner: the time is set in Settings > Accessibility >
 Visual effects > Dismiss notifications after this amount of time.
 
-Not yet: app images and avatars, buttons and reply boxes (use the notification center for those).
+Avatars come from the toast's appLogoOverride image when it is a local file. Not yet: web and app-package images, buttons and reply boxes (use the notification center for those).
 */
 // ==/WindhawkModReadme==
 
@@ -34,6 +34,7 @@ Not yet: app images and avatars, buttons and reply boxes (use the notification c
 #include <dwrite.h>
 #include <shellscalingapi.h>
 #include <uiautomation.h>
+#include <wincodec.h>
 
 #include <wchar.h>
 
@@ -141,7 +142,166 @@ struct ToastInfo {
     std::wstring app;
     std::wstring title;
     std::wstring text;
+    std::wstring image;  // local file of the avatar (appLogoOverride), empty if none
 };
+
+////////////////////////////////////////////////////////////////////////////////
+// Avatar: UI Automation doesn't expose images, so the toast XML is read from the notification database
+// (%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db) through the SQLite that ships with Windows.
+
+struct sqlite3;
+struct sqlite3_stmt;
+struct Sqlite {
+    int (*open_v2)(const char*, sqlite3**, int, const char*);
+    int (*prepare_v2)(sqlite3*, const char*, int, sqlite3_stmt**, const char**);
+    int (*step)(sqlite3_stmt*);
+    const void* (*column_blob)(sqlite3_stmt*, int);
+    int (*column_bytes)(sqlite3_stmt*, int);
+    int (*finalize)(sqlite3_stmt*);
+    int (*close)(sqlite3*);
+    bool loaded = false;
+} g_sqlite;
+
+constexpr int SQLITE_OPEN_READONLY = 0x1;
+constexpr int SQLITE_ROW = 100;
+
+bool LoadSqlite() {
+    if (g_sqlite.loaded) {
+        return true;
+    }
+    HMODULE module = LoadLibraryExW(L"winsqlite3.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) {
+        Wh_Log(L"winsqlite3.dll unavailable");
+        return false;
+    }
+    auto get = [module](const char* name) { return (void*)GetProcAddress(module, name); };
+    *(void**)&g_sqlite.open_v2 = get("sqlite3_open_v2");
+    *(void**)&g_sqlite.prepare_v2 = get("sqlite3_prepare_v2");
+    *(void**)&g_sqlite.step = get("sqlite3_step");
+    *(void**)&g_sqlite.column_blob = get("sqlite3_column_blob");
+    *(void**)&g_sqlite.column_bytes = get("sqlite3_column_bytes");
+    *(void**)&g_sqlite.finalize = get("sqlite3_finalize");
+    *(void**)&g_sqlite.close = get("sqlite3_close");
+    g_sqlite.loaded = g_sqlite.open_v2 && g_sqlite.prepare_v2 && g_sqlite.step && g_sqlite.column_blob &&
+                      g_sqlite.column_bytes && g_sqlite.finalize && g_sqlite.close;
+    return g_sqlite.loaded;
+}
+
+std::string ToUtf8(const std::wstring& text) {
+    int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    std::string result(size, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), (int)text.size(), result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+std::wstring FromUtf8(const std::string& text) {
+    int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), (int)text.size(), nullptr, 0);
+    std::wstring result(size, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), (int)text.size(), result.data(), size);
+    return result;
+}
+
+std::string XmlUnescape(std::string s) {
+    const std::pair<const char*, const char*> entities[] = {
+        {"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&apos;", "'"}, {"&#xA;", "\n"}, {"&amp;", "&"}};
+    for (auto [from, to] : entities) {
+        for (size_t at = 0; (at = s.find(from, at)) != std::string::npos; at += strlen(to)) {
+            s.replace(at, strlen(from), to);
+        }
+    }
+    return s;
+}
+
+std::string PercentDecode(const std::string& s) {
+    std::string result;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) && isxdigit((unsigned char)s[i + 2])) {
+            result += (char)strtol(s.substr(i + 1, 2).c_str(), nullptr, 16);
+            i += 2;
+        } else {
+            result += s[i];
+        }
+    }
+    return result;
+}
+
+// Value of an attribute inside one tag, still XML-escaped.
+std::string Attribute(const std::string& tag, const char* name) {
+    std::string key = std::string(" ") + name + "=\"";
+    size_t at = tag.find(key);
+    if (at == std::string::npos) {
+        return {};
+    }
+    at += key.size();
+    size_t end = tag.find('"', at);
+    return end == std::string::npos ? std::string() : tag.substr(at, end - at);
+}
+
+// The avatar file from a toast payload: the appLogoOverride image as a local path (file:/// URL or plain path).
+std::wstring AvatarFromPayload(const std::string& payload) {
+    for (size_t at = 0; (at = payload.find("<image", at)) != std::string::npos; at++) {
+        size_t end = payload.find('>', at);
+        if (end == std::string::npos) {
+            break;
+        }
+        std::string tag = payload.substr(at, end - at);
+        if (Attribute(tag, "placement") != "appLogoOverride") {
+            continue;
+        }
+        std::string src = XmlUnescape(Attribute(tag, "src"));
+        if (src.rfind("file:///", 0) == 0) {
+            src = PercentDecode(src.substr(8));
+        } else if (src.size() < 3 || src[1] != ':') {
+            return {};  // ms-appx, ms-appdata and web images aren't supported yet
+        }
+        std::replace(src.begin(), src.end(), '/', '\\');
+        return FromUtf8(src);
+    }
+    return {};
+}
+
+// Finds the newest stored toast whose text contains both the title and the message, and returns its avatar.
+std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
+    if (!LoadSqlite()) {
+        return {};
+    }
+    WCHAR localAppData[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData))) {
+        return {};
+    }
+    std::string path = ToUtf8(std::wstring(localAppData) + L"\\Microsoft\\Windows\\Notifications\\wpndatabase.db");
+    sqlite3* db = nullptr;
+    if (g_sqlite.open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != 0) {
+        Wh_Log(L"Opening the notification database failed");
+        if (db) {
+            g_sqlite.close(db);
+        }
+        return {};
+    }
+    std::string wantTitle = ToUtf8(title), wantText = ToUtf8(text);
+    std::wstring result;
+    sqlite3_stmt* stmt = nullptr;
+    if (g_sqlite.prepare_v2(db,
+                            "SELECT Payload FROM Notification WHERE Type = 'toast' ORDER BY ArrivalTime DESC LIMIT 30",
+                            -1, &stmt, nullptr) == 0) {
+        while (g_sqlite.step(stmt) == SQLITE_ROW) {
+            auto data = (const char*)g_sqlite.column_blob(stmt, 0);
+            int size = g_sqlite.column_bytes(stmt, 0);
+            if (!data || size <= 0) {
+                continue;
+            }
+            std::string payload(data, size);
+            std::string plain = XmlUnescape(payload);
+            if (plain.find(wantTitle) != std::string::npos && plain.find(wantText) != std::string::npos) {
+                result = AvatarFromPayload(payload);
+                break;
+            }
+        }
+        g_sqlite.finalize(stmt);
+    }
+    g_sqlite.close(db);
+    return result;
+}
 
 enum class Action { Open, Dismiss };
 
@@ -322,7 +482,9 @@ DWORD WINAPI WorkerThread(LPVOID) {
                         }
                         ToastInfo info{id, ChildName(element, senderCondition->p), ChildName(element, titleCondition->p),
                                        ChildName(element, textCondition->p)};
-                        Wh_Log(L"Toast %s: %s / %s", info.app.c_str(), info.title.c_str(), info.text.c_str());
+                        info.image = FindAvatar(info.title, info.text);
+                        Wh_Log(L"Toast %s: %s / %s [%s]", info.app.c_str(), info.title.c_str(), info.text.c_str(),
+                               info.image.c_str());
                         current.push_back({info, element});
                     }
                 }
@@ -376,6 +538,7 @@ struct Card {
     ToastInfo info;
     IDWriteTextLayout* title = nullptr;
     IDWriteTextLayout* text = nullptr;
+    ID2D1Bitmap* avatar = nullptr;
     float height = 0;
     ULONGLONG shownAt = 0;
     ULONGLONG goneAt = 0;  // 0 while the system banner still has the toast
@@ -388,6 +551,7 @@ bool g_hoverClose = false;
 
 ID2D1Factory* g_d2d = nullptr;
 IDWriteFactory* g_dwrite = nullptr;
+IWICImagingFactory* g_wic = nullptr;
 IDWriteTextFormat* g_titleFormat = nullptr;
 IDWriteTextFormat* g_textFormat = nullptr;
 IDWriteTextFormat* g_letterFormat = nullptr;
@@ -421,6 +585,36 @@ void ReleaseCard(Card& card) {
     if (card.text) {
         card.text->Release();
     }
+    if (card.avatar) {
+        card.avatar->Release();
+    }
+}
+
+// Decodes an image file into a bitmap for the render target (premultiplied BGRA, as Direct2D wants it).
+ID2D1Bitmap* LoadBitmap(const std::wstring& path) {
+    if (path.empty() || !g_wic) {
+        return nullptr;
+    }
+    ID2D1Bitmap* bitmap = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICFormatConverter* converter = nullptr;
+    if (SUCCEEDED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad,
+                                                   &decoder)) &&
+        SUCCEEDED(decoder->GetFrame(0, &frame)) && SUCCEEDED(g_wic->CreateFormatConverter(&converter)) &&
+        SUCCEEDED(converter->Initialize(frame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+                                        WICBitmapPaletteTypeMedianCut))) {
+        g_target->CreateBitmapFromWicBitmap(converter, nullptr, &bitmap);
+    }
+    if (!bitmap) {
+        Wh_Log(L"Loading the avatar failed: %s", path.c_str());
+    }
+    for (IUnknown* object : std::initializer_list<IUnknown*>{converter, frame, decoder}) {
+        if (object) {
+            object->Release();
+        }
+    }
+    return bitmap;
 }
 
 void LayoutCard(Card& card) {
@@ -435,6 +629,7 @@ void LayoutCard(Card& card) {
         textHeight = std::min(metrics.height, 2 * kLine);
     }
     card.height = std::max(kAvatar, kLine + textHeight) + 2 * kCardPadY;
+    card.avatar = LoadBitmap(card.info.image);
 }
 
 void ApplySnapshot() {
@@ -546,15 +741,30 @@ bool Render() {
             border->Release();
         }
 
-        // Avatar: a circle with the app's first letter until real images come.
+        // Avatar: the toast's image cropped to a circle (object-fit: cover), otherwise the app's first letter.
         float cx = rect.left + kCardPadX + kAvatar / 2, cy = rect.top + card.height / 2;
-        if (ID2D1SolidColorBrush* fill = Brush(0x808080, 0.3f * alpha)) {
+        ID2D1BitmapBrush* avatarBrush = nullptr;
+        if (card.avatar) {
+            D2D1_SIZE_F size = card.avatar->GetSize();
+            float fit = kAvatar / std::min(size.width, size.height);
+            D2D1_BITMAP_BRUSH_PROPERTIES brushProps{D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                                                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR};
+            D2D1_BRUSH_PROPERTIES common{alpha, D2D1::Matrix3x2F::Scale(fit, fit) *
+                                                    D2D1::Matrix3x2F::Translation(cx - size.width * fit / 2,
+                                                                                  cy - size.height * fit / 2)};
+            g_target->CreateBitmapBrush(card.avatar, &brushProps, &common, &avatarBrush);
+        }
+        if (avatarBrush) {
+            D2D1_ELLIPSE circle{{cx, cy}, kAvatar / 2, kAvatar / 2};
+            g_target->FillEllipse(&circle, avatarBrush);
+            avatarBrush->Release();
+        } else if (ID2D1SolidColorBrush* fill = Brush(0x808080, 0.3f * alpha)) {
             D2D1_ELLIPSE circle{{cx, cy}, kAvatar / 2, kAvatar / 2};
             g_target->FillEllipse(&circle, fill);
             fill->Release();
         }
         std::wstring source = card.info.app.empty() ? card.info.title : card.info.app;
-        if (!source.empty()) {
+        if (!card.avatar && !source.empty()) {
             wchar_t letter[2] = {(wchar_t)towupper(source[0]), 0};
             if (ID2D1SolidColorBrush* ink = Brush(0xe4e6eb, alpha)) {
                 D2D1_RECT_F box{cx - kAvatar / 2, cy - kAvatar / 2, cx + kAvatar / 2, cy + kAvatar / 2};
@@ -695,6 +905,8 @@ bool CreateResources() {
                                    reinterpret_cast<IUnknown**>(&g_dwrite)))) {
         return false;
     }
+    // Without WIC the cards just show letters instead of avatars.
+    CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_wic));
     g_dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
                                DWRITE_FONT_STRETCH_NORMAL, kFontSize, L"", &g_titleFormat);
     g_dwrite->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -746,7 +958,7 @@ void ReleaseResources() {
         DeleteDC(g_memDC);
     }
     for (IUnknown* object : std::initializer_list<IUnknown*>{g_target, g_letterFormat, g_textFormat, g_titleFormat,
-                                                             g_dwrite, g_d2d}) {
+                                                             g_dwrite, g_wic, g_d2d}) {
         if (object) {
             object->Release();
         }
