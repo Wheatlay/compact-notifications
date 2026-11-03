@@ -17,6 +17,7 @@
 #include <uiautomation.h>
 
 #include <string.h>
+#include <wchar.h>
 
 WINUSERAPI UINT WINAPI GetDpiForWindow(HWND);
 
@@ -282,7 +283,7 @@ void Wh_ModAfterInit() {
             return;
     }
     WCHAR commandLine[MAX_PATH + 2 + (sizeof(L" -tool-mod \"" WH_MOD_ID "\"") / sizeof(WCHAR)) - 1];
-    swprintf_s(commandLine, L"\"%s\" -tool-mod \"%s\"", currentProcessPath, WH_MOD_ID);
+    swprintf(commandLine, ARRAYSIZE(commandLine), L"\"%s\" -tool-mod \"%s\"", currentProcessPath, WH_MOD_ID);
     HMODULE kernelModule = GetModuleHandle(L"kernelbase.dll");
     if (!kernelModule) {
         kernelModule = GetModuleHandle(L"kernel32.dll");
