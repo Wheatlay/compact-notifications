@@ -109,6 +109,7 @@ works as before. Turning the mod off brings the original banners back.
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -414,12 +415,7 @@ std::wstring AvatarFromPayload(const std::string& payload, const std::wstring& a
         };
         auto starts = [&](const wchar_t* prefix) { return _wcsnicmp(src.c_str(), prefix, wcslen(prefix)) == 0; };
         if (starts(L"http://") || starts(L"https://")) {
-            WCHAR file[MAX_PATH];
-            if (SUCCEEDED(URLDownloadToCacheFileW(nullptr, src.c_str(), file, ARRAYSIZE(file), 0, nullptr))) {
-                return file;
-            }
-            Log(L"Downloading the avatar failed: %s", src.c_str());
-            return {};
+            return src;  // downloaded in the background (StartAvatarDownload), the card shows a letter until then
         }
         if (starts(L"ms-appx:///")) {
             std::wstring root = PackagePath(family);
@@ -512,19 +508,33 @@ std::vector<ToastInfo> g_snapshot;  // guarded by g_mutex
 std::vector<Command> g_commands;    // guarded by g_mutex
 
 HANDLE g_stopEvent = nullptr;
+HANDLE g_wakeEvent = nullptr;  // set when the banner window shows or moves, or a card is clicked
 HANDLE g_workerThread = nullptr;
 HANDLE g_uiThread = nullptr;
 DWORD g_uiThreadId = 0;
 HWND g_window = nullptr;
+std::atomic<DWORD> g_shellPid{0};  // ShellExperienceHost, whose window events wake the worker
+HWINEVENTHOOK g_eventHook = nullptr;  // owned by the card thread
 
 constexpr UINT WM_APP_SNAPSHOT = WM_APP + 1;
 constexpr UINT WM_APP_SETTINGS = WM_APP + 2;
-constexpr DWORD kPollMs = 100;
+constexpr UINT WM_APP_REHOOK = WM_APP + 3;  // ShellExperienceHost restarted: watch the new process
+constexpr UINT WM_APP_AVATAR = WM_APP + 4;  // a downloaded avatar is ready (lParam: AvatarReady*)
+// While a banner is up its toasts are read this often (typing, removed toasts). With no banner the worker sleeps
+// until a window event and only checks every kIdleMs in case one was missed.
+constexpr DWORD kPollMs = 100, kIdleMs = 2000;
 
-HWND FindVisibleBanner() {
+// The banner window: the persistent one (any size) or only while it shows a toast.
+HWND FindBanner(bool showing) {
     HWND hwnd = nullptr;
     while ((hwnd = FindWindowExW(HWND_DESKTOP, hwnd, L"Windows.UI.Core.CoreWindow", nullptr)) != nullptr) {
-        if (!IsWindowVisible(hwnd) || !IsBannerWindow(hwnd)) {
+        if (!IsBannerWindow(hwnd)) {
+            continue;
+        }
+        if (!showing) {
+            return hwnd;
+        }
+        if (!IsWindowVisible(hwnd)) {
             continue;
         }
         // At rest the window shrinks to a sliver; a real banner is at least ~80 px tall.
@@ -535,6 +545,75 @@ HWND FindVisibleBanner() {
         }
     }
     return nullptr;
+}
+
+HWND FindVisibleBanner() {
+    return FindBanner(true);
+}
+
+struct AvatarReady {
+    std::wstring id;    // toast
+    std::wstring path;  // downloaded file
+};
+
+// Web avatars download on their own thread, so a slow server never holds up the cards. The thread keeps the mod's
+// DLL loaded until it finishes, so unloading the mod in the meantime is safe.
+DWORD WINAPI AvatarDownloadThread(LPVOID param) {
+    auto job = static_cast<AvatarReady*>(param);
+    WCHAR file[MAX_PATH];
+    HRESULT hr = URLDownloadToCacheFileW(nullptr, job->path.c_str(), file, ARRAYSIZE(file), 0, nullptr);
+    if (SUCCEEDED(hr)) {
+        job->path = file;
+        HWND window = g_window;
+        if (!window || !PostMessage(window, WM_APP_AVATAR, 0, (LPARAM)job)) {
+            delete job;
+        }
+    } else {
+        Log(L"Downloading the avatar failed (%08lX): %s", hr, job->path.c_str());
+        delete job;
+    }
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&AvatarDownloadThread, &self);
+    FreeLibraryAndExitThread(self, 0);
+}
+
+void StartAvatarDownload(const std::wstring& id, const std::wstring& url) {
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&AvatarDownloadThread, &self)) {
+        return;
+    }
+    HANDLE thread = CreateThread(nullptr, 0, AvatarDownloadThread, new AvatarReady{id, url}, 0, nullptr);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        FreeLibrary(self);
+    }
+}
+
+DWORD BannerProcess() {
+    DWORD pid = 0;
+    if (HWND banner = FindBanner(false)) {
+        GetWindowThreadProcessId(banner, &pid);
+    }
+    return pid;
+}
+
+void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG idObject, LONG, DWORD, DWORD) {
+    if (idObject == OBJID_WINDOW && hwnd && IsBannerWindow(hwnd)) {
+        SetEvent(g_wakeEvent);
+    }
+}
+
+// Window shown, hidden or moved/resized in ShellExperienceHost (the banner grows from a sliver when a toast comes).
+HWINEVENTHOOK HookBannerEvents() {
+    DWORD pid = BannerProcess();
+    g_shellPid = pid;
+    if (!pid) {
+        return nullptr;  // not running yet: the worker's idle check hooks it later
+    }
+    return SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE, nullptr, WinEventProc, pid, 0,
+                           WINEVENT_OUTOFCONTEXT);
 }
 
 template <typename T>
@@ -709,7 +788,16 @@ DWORD WINAPI WorkerThread(LPVOID) {
             }
         };
 
-        while (WaitForSingleObject(g_stopEvent, kPollMs) == WAIT_TIMEOUT) {
+        bool busy = true;  // a banner was up on the last pass (or this is the first pass)
+        HANDLE waits[] = {g_stopEvent, g_wakeEvent};
+        while (WaitForMultipleObjects(2, waits, FALSE, busy ? kPollMs : kIdleMs) != WAIT_OBJECT_0) {
+            if (!busy) {
+                // ShellExperienceHost restarts (or starts late): its window events need a new hook.
+                DWORD pid = BannerProcess();
+                if (pid && pid != g_shellPid && g_window) {
+                    PostMessage(g_window, WM_APP_REHOOK, 0, 0);
+                }
+            }
             std::vector<Command> commands;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
@@ -743,7 +831,9 @@ DWORD WINAPI WorkerThread(LPVOID) {
             }
 
             std::vector<Known> current;
-            if (HWND banner = FindVisibleBanner()) {
+            HWND banner = FindVisibleBanner();
+            busy = banner != nullptr;
+            if (banner) {
                 Com<IUIAutomationElement> root;
                 Com<IUIAutomationElementArray> toasts;
                 if (SUCCEEDED(uia->ElementFromHandle(banner, root.put())) && root &&
@@ -776,6 +866,10 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                 info = old->info;
                             } else {
                                 info.image = FindAvatar(info.title, info.text);
+                                if (info.image.rfind(L"http", 0) == 0) {
+                                    StartAvatarDownload(info.id, info.image);
+                                    info.image.clear();
+                                }
                                 BSTR automationId = nullptr;
                                 element->get_CurrentAutomationId(&automationId);
                                 info.priority = automationId && wcsncmp(automationId, L"PriorityToastView", 17) == 0;
@@ -1384,6 +1478,7 @@ Hit HitTest(POINT pt) {
 void SendCommand(const std::wstring& id, Action action, int index = 0) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_commands.push_back({id, action, index});
+    SetEvent(g_wakeEvent);
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1394,6 +1489,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_TIMER:
             Redraw();
+            return 0;
+        case WM_APP_AVATAR: {
+            std::unique_ptr<AvatarReady> ready(reinterpret_cast<AvatarReady*>(lParam));
+            for (auto& card : g_cards) {
+                if (card.info.id == ready->id && !card.avatar) {
+                    card.info.image = ready->path;
+                    card.avatar = LoadBitmap(ready->path);
+                }
+            }
+            Redraw();
+            return 0;
+        }
+        case WM_APP_REHOOK:
+            if (g_eventHook) {
+                UnhookWinEvent(g_eventHook);
+            }
+            g_eventHook = HookBannerEvents();
+            Log(L"Watching ShellExperienceHost %lu", g_shellPid.load());
             return 0;
         case WM_APP_SETTINGS:
             // Size and lines change the layout of the cards already shown.
@@ -1546,9 +1659,15 @@ DWORD WINAPI UiThread(LPVOID) {
         g_window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName,
                                    L"Messy toasts", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
         Log(L"Card window %p (error %lu)", g_window, g_window ? 0 : GetLastError());
+        // Out-of-context window events arrive through this thread's message loop.
+        g_eventHook = HookBannerEvents();
         MSG msg;
         while (GetMessage(&msg, nullptr, 0, 0) > 0) {
             DispatchMessage(&msg);
+        }
+        if (g_eventHook) {
+            UnhookWinEvent(g_eventHook);
+            g_eventHook = nullptr;
         }
         DestroyWindow(g_window);
         g_window = nullptr;
@@ -1563,9 +1682,10 @@ DWORD WINAPI UiThread(LPVOID) {
 
 BOOL WhTool_ModInit() {
     g_stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    g_wakeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     g_uiThread = CreateThread(nullptr, 0, UiThread, nullptr, 0, &g_uiThreadId);
     g_workerThread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
-    return g_stopEvent && g_uiThread && g_workerThread;
+    return g_stopEvent && g_wakeEvent && g_uiThread && g_workerThread;
 }
 
 void WhTool_ModSettingsChanged() {}

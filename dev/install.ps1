@@ -42,6 +42,10 @@ if ($Dll) {
 	# The engine reloads the mod when LibraryFileName changes, so that goes last.
 	Set-ItemProperty $key SettingsChangeTime ([int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Type DWord
 	Set-ItemProperty $key LibraryFileName (Split-Path $Dll -Leaf)
+	# Older builds of this mod; the one still loaded until the reload finishes stays and goes next time.
+	Start-Sleep -Seconds 3
+	Get-ChildItem "$data/Engine/Mods/64" -Filter "local@${Id}_*.dll" | Where-Object Name -ne (Split-Path $Dll -Leaf) |
+		ForEach-Object { Remove-Item $_.FullName -ErrorAction SilentlyContinue }
 	exit 0
 }
 
