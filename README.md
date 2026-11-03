@@ -1,8 +1,8 @@
 # windhawk-toasts
 
-Windhawk mod that replaces Windows toast banners with custom cards in the style of Messy's toasts.
+Windhawk mod that replaces Windows toast banners with custom cards in a compact chat style.
 
-- `messy-toasts.wh.cpp`: the mod.
+- `compact-notifications.wh.cpp`: the mod.
 - `probe.wh.cpp`: research mod, only logs the UI Automation tree of each toast banner.
 - `test-toast.ps1`: shows test toasts (`text`, `image`, `buttons` or all).
 - `dev/`: tools to work without the Windhawk editor (below).
@@ -21,16 +21,16 @@ Windhawk mod that replaces Windows toast banners with custom cards in the style 
 ## Development without the editor
 
 - `powershell -File dev/install.ps1`: compiles the mod with Windhawk's compiler and flags (same as the editor),
-  copies it to `C:\ProgramData\Windhawk\Engine\Mods\64`, points `HKLM\SOFTWARE\Windhawk\Engine\Mods\local@messy-toasts`
+  copies it to `C:\ProgramData\Windhawk\Engine\Mods\64`, points `HKLM\SOFTWARE\Windhawk\Engine\Mods\local@compact-notifications`
   at it (logging on), and Windhawk reloads it. Elevates itself; with UAC prompts off this is silent.
-- Log: create an empty `%TEMP%\messy-toasts.log`; the mod appends to it while the file exists. (Windhawk's own log
+- Log: create an empty `%TEMP%\compact-notifications.log`; the mod appends to it while the file exists. (Windhawk's own log
   goes through OutputDebugString, which `dev/log.ps1` collects, but nothing from this mod showed up there.)
 - `powershell -File dev/harness.ps1`: builds the reading and drawing part as a plain program with the log on the
   console, outside Windhawk (the installed mod still hides the banner).
 - `powershell -File dev/shot.ps1`: screenshot of the bottom right corner. Fails while the screen is locked or off.
 - Syntax check only: `clang++ -std=c++23 -target x86_64-w64-mingw32 -include windhawk_api.h -DWH_MOD
-  '-DWH_MOD_ID=L"messy-toasts"' '-DWH_MOD_VERSION=L"0.1"' -DUNICODE -D_UNICODE -DWINVER=0x0A00
-  -D_WIN32_WINNT=0x0A00 -Wall -c -o /dev/null messy-toasts.wh.cpp` (Git Bash, compiler from
+  '-DWH_MOD_ID=L"compact-notifications"' '-DWH_MOD_VERSION=L"0.1"' -DUNICODE -D_UNICODE -DWINVER=0x0A00
+  -D_WIN32_WINNT=0x0A00 -Wall -c -o /dev/null compact-notifications.wh.cpp` (Git Bash, compiler from
   `C:\Program Files\Windhawk\Compiler\bin`).
 
 ## Outside this folder
@@ -38,8 +38,8 @@ Windhawk mod that replaces Windows toast banners with custom cards in the style 
 - Windhawk (`winget install RamenSoftware.Windhawk`).
 - Windhawk keeps the source of local mods in `C:\ProgramData\Windhawk\ModsSource`, the compiled ones in
   `C:\ProgramData\Windhawk\Engine\Mods` and their settings in `HKLM\SOFTWARE\Windhawk\Engine\Mods`; `dev/install.ps1`
-  writes there (`local@messy-toasts`), old DLLs are left behind.
-- `%TEMP%\messy-toasts.log` (only if created) and `%TEMP%\toast-harness.exe` from the harness.
+  writes there (`local@compact-notifications`), old DLLs are left behind.
+- `%TEMP%\compact-notifications.log` (only if created) and `%TEMP%\toast-harness.exe` from the harness.
 
 ## License
 

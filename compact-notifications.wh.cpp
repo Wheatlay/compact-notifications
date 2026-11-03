@@ -1,10 +1,11 @@
 // ==WindhawkMod==
-// @id              messy-toasts
-// @name            Messy toasts
-// @description     Replaces Windows notification banners with compact cards in the style of the Messy app
-// @version         0.2
+// @id              compact-notifications
+// @name            Compact Notifications
+// @description     Replaces Windows notification banners with compact chat-style cards: avatar, sender and a few lines of text
+// @version         1.0
 // @author          Wheatlay
 // @github          https://github.com/Wheatlay
+// @license         GPL-3.0
 // @include         ShellExperienceHost.exe
 // @include         explorer.exe
 // @compilerOptions -lole32 -loleaut32 -ldwmapi -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs -ladvapi32 -lurlmon
@@ -16,9 +17,9 @@
 
 // ==WindhawkModReadme==
 /*
-# Messy toasts
+# Compact Notifications
 
-Replaces Windows toast banners with compact cards in the style of the Messy app: black (or white) rounded
+Replaces Windows toast banners with compact chat-style cards: black (or white) rounded
 cards with a round avatar, the sender in bold and up to a few lines of text, sliding in from the screen edge.
 
 ## What works
@@ -63,7 +64,7 @@ works as before. Turning the mod off brings the original banners back.
     - light: Always white
   - size: 130
     $name: Size (%)
-    $description: 100 is the size of Messy's own toasts. From 80 to 200.
+    $description: 100 is the base size. From 80 to 200.
   - maxLines: 4
     $name: Lines of text
     $description: Longer messages make the card taller up to this many lines; the rest is cut off with "…". From 1 to 10.
@@ -1026,7 +1027,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Drawing: one layered, never-activated window in a bottom corner with a stack of cards (page/toast.html in Messy):
+// Drawing: one layered, never-activated window in a bottom corner with a stack of cards:
 // newest at the bottom, slides in from the right, fades out. Buttons and the reply box sit under the text.
 
 constexpr float kWidth = 360;  // window width in DIPs; cards are kWidth - 2 * kPad wide
@@ -1036,7 +1037,7 @@ constexpr float kFontSize = 13, kLine = kFontSize * 1.35f;
 constexpr float kFieldHeight = 28, kRowGap = 8, kFieldRadius = 7, kButtonGap = 6;
 constexpr DWORD kInMs = 280, kOutMs = 400;
 
-// Mod settings (WindhawkModSettings). Sizes above are Messy's, in CSS pixels; "size" scales all of them.
+// Mod settings (WindhawkModSettings). Sizes above are in CSS pixels; "size" scales all of them.
 enum class ThemeChoice { Auto, Dark, Light };
 struct Settings {
     ThemeChoice theme = ThemeChoice::Auto;
@@ -1085,7 +1086,7 @@ void LoadSettings() {
         s.left ? L"Left" : L"Right", s.showActions, s.highlightPriority, s.priorityColor);
 }
 
-// Black cards in dark mode (like Messy's OLED mode), white ones in light mode.
+// Black cards in dark mode, white ones in light mode.
 struct Theme {
     UINT32 card, cardHover, border, ink, field, fieldHover;
     float borderAlpha;
@@ -1724,10 +1725,10 @@ DWORD WINAPI UiThread(LPVOID) {
         WNDCLASSW wc{};
         wc.lpfnWndProc = WindowProc;
         wc.hInstance = GetModuleHandle(nullptr);
-        wc.lpszClassName = L"MessyToasts";
+        wc.lpszClassName = L"CompactNotifications";
         RegisterClassW(&wc);
         g_window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName,
-                                   L"Messy toasts", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+                                   L"Compact Notifications", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
         Log(L"Card window %p (error %lu)", g_window, g_window ? 0 : GetLastError());
         // Out-of-context window events arrive through this thread's message loop.
         g_eventHook = HookBannerEvents();
