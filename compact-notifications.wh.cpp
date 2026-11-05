@@ -1011,12 +1011,16 @@ DWORD WINAPI WorkerThread(LPVOID) {
                         auto same = std::find_if(known.begin(), known.end(),
                                                  [&](const Known& k) { return k.runtimeId == runtimeId; });
                         ToastInfo info;
-                        if (same != known.end()) {
+                        // An app can update a toast in place (Discord does for messages sent in a row): the
+                        // element and its runtimeId stay, only the texts change, so they are compared every pass.
+                        std::wstring title = ChildName(element, titleCondition.p);
+                        std::wstring text = ChildName(element, textCondition.p);
+                        if (same != known.end() && same->info.title == title && same->info.text == text) {
                             info = same->info;
                         } else {
-                            info.app = ChildName(element, senderCondition.p);
-                            info.title = ChildName(element, titleCondition.p);
-                            info.text = ChildName(element, textCondition.p);
+                            info.app = same != known.end() ? same->info.app : ChildName(element, senderCondition.p);
+                            info.title = title;
+                            info.text = text;
                             if (Stopping()) {
                                 element->Release();  // a new toast takes many UIA calls; don't make unloading wait
                                 break;
