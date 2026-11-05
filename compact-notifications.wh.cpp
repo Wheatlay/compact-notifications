@@ -67,7 +67,6 @@ banners back.
 * Pressing a button on a card whose notification is still waiting opens the notification center off the screen
   for a moment: it takes the keyboard focus from the app you're in (a full-screen game may minimize), and the
   action takes up to a second or two.
-* Firefox doesn't store its notifications in the database, so its cards still come one after another.
 * While a full-screen app or *Do not disturb* is on, Windows doesn't show notifications at all, so there are
   no cards either.
 * The reply box on a card is simple: typing, Backspace, Ctrl+Backspace, Ctrl+V, Enter to send and Esc; no
@@ -710,7 +709,7 @@ std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
 
 // The icon a desktop app registered for its notifications (HKCU\Software\Classes\AppUserModelId\<id>, IconUri),
 // found by the app name the banner shows. Used when the toast itself has no image or isn't in the database
-// (Firefox doesn't store its toasts there).
+// (older Firefox versions didn't store their toasts there).
 std::wstring AppIcon(const std::wstring& app) {
     HKEY root;
     if (app.empty() || RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Classes\\AppUserModelId", 0, KEY_READ, &root) !=
@@ -771,7 +770,8 @@ std::vector<std::pair<std::string, std::string>> Elements(const std::string& xml
     return result;
 }
 
-// The name Start shows for an app (also for desktop apps with an AppUserModelID), as the banner shows it.
+// The app's name as the banner shows it: what Start shows for the AppUserModelID, else the name the app registered
+// for its notifications (HKCU\Software\Classes\AppUserModelId\<id>, e.g. Firefox's per-install id).
 std::wstring AppName(const std::wstring& aumid) {
     std::wstring name;
     IShellItem* item = nullptr;
@@ -782,6 +782,14 @@ std::wstring AppName(const std::wstring& aumid) {
             CoTaskMemFree(display);
         }
         item->Release();
+    }
+    if (name.empty()) {
+        WCHAR value[256];
+        DWORD size = sizeof(value);
+        if (RegGetValueW(HKEY_CURRENT_USER, (L"Software\\Classes\\AppUserModelId\\" + aumid).c_str(), L"DisplayName",
+                         RRF_RT_REG_SZ, nullptr, value, &size) == ERROR_SUCCESS) {
+            name = value;
+        }
     }
     return name;
 }
@@ -840,7 +848,7 @@ ToastInfo ToastFromPayload(const std::string& payload, const std::wstring& aumid
         }
     }
     for (auto& [tag, content] : Elements(payload, "action")) {
-        if (Attribute(tag, "placement") != "contextMenu") {
+        if (_stricmp(Attribute(tag, "placement").c_str(), "contextMenu") != 0) {  // Firefox writes "contextmenu"
             info.buttons.push_back(FromUtf8(XmlUnescape(Attribute(tag, "content"))));
         }
     }

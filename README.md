@@ -16,7 +16,7 @@ Windhawk mod that replaces Windows toast banners with custom cards in a compact 
   there (read-only, through `winsqlite3.dll` from Windows; a folder change notification wakes the reader): texts,
   buttons, reply box and avatar from the toast XML, the app name from `shell:AppsFolder`. When the banner shows the
   toast later, it is matched to the card (by title and the start of the text) instead of making a second one.
-  Toasts the database doesn't have (Firefox) are read from the banner through UI Automation, as before.
+  Toasts the database doesn't have (older Firefox versions) are read from the banner through UI Automation, as before.
 - Drawing: a layered, never-activated window in one `explorer.exe` process (Direct2D/DirectWrite/WIC). Click and
   × go through UI Automation to the banner, so the app gets its real action. Windhawk's separate "tool mod" process
   was tried first, but it didn't come back after a reload.
