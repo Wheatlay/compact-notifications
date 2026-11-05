@@ -848,24 +848,25 @@ std::string Column(sqlite3_stmt* stmt, int index) {
     return data && size > 0 ? std::string(data, size) : std::string();
 }
 
-// Toasts stored after lastOrder ([Order] grows with every stored notification, a replaced one included). The first
-// call (lastOrder -1) only finds where the table ends: older toasts came before the mod.
-std::vector<ToastInfo> NewStoredToasts(long long& lastOrder) {
+// Toasts that arrived after lastArrival (ArrivalTime, a FILETIME). Not [Order]: it is the row id, and when an app
+// removes its newest toasts (Discord does once a message is read) the next ones get the same numbers again.
+// The first call (lastArrival -1) only finds the newest one: older toasts came before the mod.
+std::vector<ToastInfo> NewStoredToasts(long long& lastArrival) {
     std::vector<ToastInfo> result;
     sqlite3* db = OpenNotificationDb();
     if (!db) {
         return result;
     }
-    bool first = lastOrder < 0;
-    std::string sql = first ? "SELECT MAX([Order]) FROM Notification"
-                            : "SELECT n.[Order], n.Payload, h.PrimaryId FROM Notification n JOIN NotificationHandler h "
-                              "ON h.RecordId = n.HandlerId WHERE n.Type = 'toast' AND n.[Order] > " +
-                                  std::to_string(lastOrder) + " ORDER BY n.[Order]";
+    bool first = lastArrival < 0;
+    std::string sql = first ? "SELECT MAX(ArrivalTime) FROM Notification"
+                            : "SELECT n.ArrivalTime, n.Payload, h.PrimaryId FROM Notification n JOIN NotificationHandler h "
+                              "ON h.RecordId = n.HandlerId WHERE n.Type = 'toast' AND n.ArrivalTime > " +
+                                  std::to_string(lastArrival) + " ORDER BY n.ArrivalTime";
     sqlite3_stmt* stmt = nullptr;
     if (g_sqlite.prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == 0) {
         while (g_sqlite.step(stmt) == SQLITE_ROW) {
-            long long order = atoll(Column(stmt, 0).c_str());
-            lastOrder = std::max(lastOrder, order);
+            long long arrival = atoll(Column(stmt, 0).c_str());
+            lastArrival = std::max(lastArrival, arrival);
             if (first) {
                 break;
             }
@@ -877,13 +878,13 @@ std::vector<ToastInfo> NewStoredToasts(long long& lastOrder) {
             if (info.title.empty() && info.text.empty()) {
                 continue;
             }
-            info.id = L"stored#" + std::to_wstring(order);
+            info.id = L"stored#" + std::to_wstring(arrival);
             result.push_back(info);
         }
         g_sqlite.finalize(stmt);
     }
     g_sqlite.close(db);
-    lastOrder = std::max(lastOrder, 0LL);
+    lastArrival = std::max(lastArrival, 0LL);
     return result;
 }
 
@@ -1242,8 +1243,8 @@ DWORD WINAPI WorkerThread(LPVOID) {
         };
         std::vector<Pending> pending;
         std::vector<std::pair<ToastInfo, ULONGLONG>> expired;  // card gone, banner not seen yet (and when)
-        long long lastOrder = -1;
-        NewStoredToasts(lastOrder);
+        long long lastArrival = -1;
+        NewStoredToasts(lastArrival);
         auto cardMs = [] {
             UINT seconds = 5;
             SystemParametersInfoW(SPI_GETMESSAGEDURATION, 0, &seconds, 0);
@@ -1490,7 +1491,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
 
             // New stored toasts (the same pass reads the banner after this, so a toast shown at once is matched).
             ULONGLONG now = GetTickCount64();
-            for (auto& info : NewStoredToasts(lastOrder)) {
+            for (auto& info : NewStoredToasts(lastArrival)) {
                 bool shown = std::any_of(known.begin(), known.end(),
                                          [&](const Known& k) { return SameToast(info, k.info.title, k.info.text); });
                 Log(L"Stored toast %s: %s / %s%s", info.app.c_str(), info.title.c_str(), info.text.c_str(),
@@ -1532,7 +1533,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
                 expired.push_back({it->info, now});
                 it = pending.erase(it);
             }
-            std::erase_if(expired, [&](const auto& e) { return now - e.second > 5 * 60 * 1000; });
+            std::erase_if(expired, [&](const auto& e) { return now - e.second > 2 * 60 * 1000; });
 
             std::vector<Known> current;
             HWND banner = FindVisibleBanner();
