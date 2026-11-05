@@ -1,8 +1,8 @@
-// ==WindhawkMod==
+﻿// ==WindhawkMod==
 // @id              compact-notifications
 // @name            Compact Notifications
 // @description     Replaces Windows notification banners with compact chat-style cards: avatar, sender and a few lines of text
-// @version         1.0
+// @version         1.1
 // @author          Wheatlay
 // @github          https://github.com/Wheatlay
 // @license         GPL-3.0
@@ -1140,6 +1140,18 @@ void RestoreCenter(HWND hwnd) {
     }
 }
 
+// At load: a center left off the screen (Explorer crashed while the mod used it) goes back.
+void RestoreLostCenter(DWORD shellPid) {
+    HWND hwnd = nullptr;
+    while ((hwnd = FindWindowExW(HWND_DESKTOP, hwnd, L"Windows.UI.Core.CoreWindow", nullptr)) != nullptr) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == shellPid && !IsBannerTitle(hwnd)) {
+            RestoreCenter(hwnd);
+        }
+    }
+}
+
 HWND OpenCenter() {
     if (HWND hwnd = ForegroundCenter()) {
         return hwnd;
@@ -1246,6 +1258,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
         std::vector<std::pair<ToastInfo, ULONGLONG>> expired;  // card gone, banner not seen yet (and when)
         long long lastArrival = -1;
         NewStoredToasts(lastArrival);
+        ULONGLONG lastDbRead = GetTickCount64();
         auto cardMs = [] {
             UINT seconds = 5;
             SystemParametersInfoW(SPI_GETMESSAGEDURATION, 0, &seconds, 0);
@@ -1416,6 +1429,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
 
         bool busy = true;     // a banner was up on the last pass (or this is the first pass)
         bool typing = false;  // a reply box had the keyboard focus on the last pass
+        bool centerChecked = false;
         HANDLE waits[] = {g_stopEvent, g_wakeEvent, dbChange};
         DWORD waitCount = dbChange != INVALID_HANDLE_VALUE ? 3 : 2;
         DWORD woke;
@@ -1425,6 +1439,10 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                                                          : kIdleMs)) != WAIT_OBJECT_0) {
             if (woke == WAIT_OBJECT_0 + 2) {
                 FindNextChangeNotification(dbChange);
+            }
+            if (!centerChecked && g_shellPid) {
+                RestoreLostCenter(g_shellPid);
+                centerChecked = true;
             }
             if (!busy) {
                 // ShellExperienceHost restarts (or starts late): its window events need a new hook.
@@ -1491,8 +1509,16 @@ DWORD WINAPI WorkerThread(LPVOID) {
             }
 
             // New stored toasts (the same pass reads the banner after this, so a toast shown at once is matched).
+            // The folder change notification comes late or not at all for the database's writes, so it is read on
+            // every pass while toasts are on the screen (every kBannerMs), and otherwise when something woke the
+            // worker (a banner showing, the folder changing) or every kIdleMs.
             ULONGLONG now = GetTickCount64();
-            for (auto& info : NewStoredToasts(lastArrival)) {
+            std::vector<ToastInfo> stored;
+            if (woke != WAIT_TIMEOUT || busy || !pending.empty() || now - lastDbRead >= kIdleMs) {
+                stored = NewStoredToasts(lastArrival);
+                lastDbRead = now;
+            }
+            for (auto& info : stored) {
                 bool shown = std::any_of(known.begin(), known.end(),
                                          [&](const Known& k) { return SameToast(info, k.info.title, k.info.text); });
                 Log(L"Stored toast %s: %s / %s%s", info.app.c_str(), info.title.c_str(), info.text.c_str(),
