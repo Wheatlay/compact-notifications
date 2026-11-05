@@ -8,7 +8,7 @@
 // @license         GPL-3.0
 // @include         ShellExperienceHost.exe
 // @include         explorer.exe
-// @compilerOptions -lole32 -loleaut32 -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs -ladvapi32 -lshell32
+// @compilerOptions -lole32 -loleaut32 -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs -ladvapi32 -lshell32 -ldwmapi
 // ==/WindhawkMod==
 
 // The banner detection idea comes from the "Toast auto-dismiss" mod by nikitor32 (GPL-3.0),
@@ -188,6 +188,7 @@ banners back.
 #include <appmodel.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <dwmapi.h>
 
 #include <windhawk_utils.h>
 
@@ -1945,6 +1946,19 @@ RECT WorkArea() {
     return mi.rcWork;
 }
 
+// Milliseconds for animations. GetTickCount64 only moves every ~15.6 ms, so on a 144 Hz screen several frames in a
+// row would draw the same step.
+ULONGLONG NowMs() {
+    static LARGE_INTEGER frequency = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f;
+    }();
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (ULONGLONG)(counter.QuadPart * 1000 / frequency.QuadPart);
+}
+
 // How far an animation of ms milliseconds is after elapsed ones, 0 to 1 (done at once when ms is 0).
 float Progress(ULONGLONG elapsed, DWORD ms) {
     return ms ? std::clamp(elapsed / (float)ms, 0.0f, 1.0f) : 1.0f;
@@ -2100,7 +2114,7 @@ void ApplySnapshot() {
         std::lock_guard<std::mutex> lock(g_mutex);
         snapshot = g_snapshot;
     }
-    ULONGLONG now = GetTickCount64();
+    ULONGLONG now = NowMs();
     for (auto& card : g_cards) {
         auto live = std::find_if(snapshot.begin(), snapshot.end(), [&](const ToastInfo& t) { return t.id == card.info.id; });
         if (live == snapshot.end()) {
@@ -2336,7 +2350,7 @@ void DrawCard(Card& card, int index, float x, float alpha) {
 
 // Returns whether anything is still animating.
 bool Render() {
-    ULONGLONG now = GetTickCount64();
+    ULONGLONG now = NowMs();
     g_cards.erase(std::remove_if(g_cards.begin(), g_cards.end(),
                                  [&](Card& c) {
                                      bool done = c.goneAt && now - c.goneAt >= g_settings.outMs;
@@ -2407,12 +2421,11 @@ bool Render() {
     return animating;
 }
 
+// While cards move or fade, the card thread draws a frame per screen refresh (see UiThread).
+bool g_animating = false;
+
 void Redraw() {
-    if (Render()) {
-        SetTimer(g_window, 1, 15, nullptr);
-    } else {
-        KillTimer(g_window, 1);
-    }
+    g_animating = Render();
 }
 
 bool Inside(D2D1_RECT_F rect, float x, float y) {
@@ -2456,9 +2469,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_APP_SNAPSHOT:
             ApplySnapshot();
-            Redraw();
-            return 0;
-        case WM_TIMER:
             Redraw();
             return 0;
         case WM_APP_CENTER:
@@ -2508,7 +2518,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case Part::Body:
                 case Part::Close:
                     SendCommand(card.info.id, hit.part == Part::Body ? Action::Open : Action::Dismiss);
-                    card.goneAt = GetTickCount64();
+                    card.goneAt = NowMs();
                     break;
                 case Part::Button:
                     // The card goes when the banner drops the toast (a "snooze" may keep it).
@@ -2633,10 +2643,22 @@ DWORD WINAPI UiThread(LPVOID) {
         // Out-of-context window events arrive through this thread's message loop.
         g_eventHook = HookBannerEvents();
         // Waiting on the stop event directly: a WM_QUIT posted before this thread had a message queue would be lost.
-        while (MsgWaitForMultipleObjects(1, &g_stopEvent, FALSE, INFINITE, QS_ALLINPUT) == WAIT_OBJECT_0 + 1) {
+        // While animating it doesn't wait: after the messages, DwmFlush waits for the next screen refresh and a frame
+        // is drawn, so animations run at the monitor's rate (60, 144 Hz...) instead of a ~64 Hz timer.
+        for (;;) {
+            DWORD woke = MsgWaitForMultipleObjects(1, &g_stopEvent, FALSE, g_animating ? 0 : INFINITE, QS_ALLINPUT);
+            if (woke == WAIT_OBJECT_0 || woke == WAIT_FAILED) {
+                break;
+            }
             MSG msg;
             while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 DispatchMessage(&msg);
+            }
+            if (g_animating) {
+                if (FAILED(DwmFlush())) {
+                    Sleep(8);
+                }
+                Redraw();
             }
         }
         if (g_eventHook) {
