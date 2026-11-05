@@ -11,12 +11,22 @@ Windhawk mod that replaces Windows toast banners with custom cards in a compact 
 
 - Hiding: a `SetWindowPos` hook in `ShellExperienceHost.exe` and `explorer.exe` moves the banner window off the
   screen. The banner still exists, so clicks can be passed to it.
-- Content: title, text and app name through UI Automation on the hidden banner; the avatar (`appLogoOverride`, local
-  files only) from the notification database `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db`
-  (read-only, through `winsqlite3.dll` from Windows).
+- Content: Windows shows one banner at a time and queues the rest (about 7 s each), but writes every toast to the
+  notification database `%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db` at once. So cards come from
+  there (read-only, through `winsqlite3.dll` from Windows; a folder change notification wakes the reader): texts,
+  buttons, reply box and avatar from the toast XML, the app name from `shell:AppsFolder`. When the banner shows the
+  toast later, it is matched to the card (by title and the start of the text) instead of making a second one.
+  Toasts the database doesn't have (Firefox) are read from the banner through UI Automation, as before.
 - Drawing: a layered, never-activated window in one `explorer.exe` process (Direct2D/DirectWrite/WIC). Click and
   × go through UI Automation to the banner, so the app gets its real action. Windhawk's separate "tool mod" process
   was tried first, but it didn't come back after a reload.
+- Actions on a card whose toast still waits in the queue (no banner yet): the mod opens the notification center
+  with Win+N, kept off the screen (the card window's title tells the `ShellExperienceHost` hook to move it), finds
+  the toast there (unfolding the app's group, expanding the toast for its buttons and reply box), clicks or focuses
+  the same element and closes the center again. Windows doesn't place the center again when it opens, so the mod
+  moves it back to where it was.
+- The banner's own close button doesn't react to UI Automation (tested on 05.11.2026), so × on a card whose toast is on
+  the banner may not close it there.
 
 ## Development without the editor
 

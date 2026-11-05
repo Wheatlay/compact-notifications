@@ -8,7 +8,7 @@
 // @license         GPL-3.0
 // @include         ShellExperienceHost.exe
 // @include         explorer.exe
-// @compilerOptions -lole32 -loleaut32 -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs -ladvapi32
+// @compilerOptions -lole32 -loleaut32 -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs -ladvapi32 -lshell32
 // ==/WindhawkMod==
 
 // The banner detection idea comes from the "Toast auto-dismiss" mod by nikitor32 (GPL-3.0),
@@ -48,18 +48,26 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
 
 ## How long a card stays
 
-A card stays exactly as long as the original notification would. Windows sets this time in
-*Settings > Accessibility > Visual effects > Dismiss notifications after this amount of time*.
+A card stays as long as the original notification would, counted from when it arrives. Windows sets this time in
+*Settings > Accessibility > Visual effects > Dismiss notifications after this amount of time*. Reminders, alarms
+and calls stay until handled.
 
 ## How it works
 
-Windows still creates its own banner, but the mod moves it off the screen and reads it (UI Automation and
-the notification database). Clicks and typing on a card go to the hidden banner, so every app action
-works as before. Turning the mod off brings the original banners back.
+Windows shows one banner at a time and makes the next ones wait (about 7 seconds each). The mod makes cards
+from the notification database as soon as a notification arrives, so messages sent in a row show together.
+Windows still creates its own banner, but the mod moves it off the screen. Clicks and typing on a card go to
+the hidden banner; for a notification still waiting for its banner, the mod opens the notification center off
+the screen and acts there, so every app action works as before. Turning the mod off brings the original
+banners back.
 
 ## Limitations
 
 * Text styles, progress bars and large (hero) images are not shown.
+* Pressing a button on a card whose notification is still waiting opens the notification center off the screen
+  for a moment: it takes the keyboard focus from the app you're in (a full-screen game may minimize), and the
+  action takes up to a second or two.
+* Firefox doesn't store its notifications in the database, so its cards still come one after another.
 * While a full-screen app or *Do not disturb* is on, Windows doesn't show notifications at all, so there are
   no cards either.
 * The reply box on a card shows the typed text with the caret at the end; moving the caret with the arrow
@@ -178,6 +186,8 @@ works as before. Turning the mod off brings the original banners back.
 #include <uiautomation.h>
 #include <wincodec.h>
 #include <appmodel.h>
+#include <shellapi.h>
+#include <shobjidl.h>
 
 #include <windhawk_utils.h>
 
@@ -356,17 +366,33 @@ int OffscreenX() {
 // (explorer restarting, Direct2D unavailable) the normal banners show.
 constexpr wchar_t kWindowClass[] = L"CompactNotifications";
 
+// The card window's title while the mod opens the notification center itself (see OpenCenter): the center is kept
+// off the screen then. A window title is the flag because ShellExperienceHost, an app container, can't open the
+// named objects of explorer, but can find its windows.
+constexpr wchar_t kCardTitle[] = L"Compact Notifications";
+constexpr wchar_t kCenterTitle[] = L"Compact Notifications (center)";
+
+bool g_explorer = false;  // this copy runs in explorer (else in ShellExperienceHost)
+
 std::atomic<int> g_bannerX{INT_MIN};  // where Windows last put the banner, for RestoreBanner
 
+// The notification center: ShellExperienceHost's other core window.
+bool IsCenterWindow(HWND hwnd) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    return !g_explorer && pid == GetCurrentProcessId() && IsCoreWindowClass(hwnd) && !IsBannerTitle(hwnd);
+}
+
 BOOL WINAPI SetWindowPos_Hook(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags) {
-    if ((uFlags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE) && IsBannerWindow(hWnd) &&
-        FindWindowW(kWindowClass, nullptr)) {
+    if ((uFlags & (SWP_NOMOVE | SWP_NOSIZE)) != (SWP_NOMOVE | SWP_NOSIZE) &&
+        ((IsBannerWindow(hWnd) && FindWindowW(kWindowClass, nullptr)) ||
+         (IsCenterWindow(hWnd) && FindWindowW(kWindowClass, kCenterTitle)))) {
         if (uFlags & SWP_NOMOVE) {
             RECT rc{};
             GetWindowRect(hWnd, &rc);
             Y = rc.top;
             uFlags &= ~SWP_NOMOVE;
-        } else {
+        } else if (IsBannerTitle(hWnd)) {
             g_bannerX = X;
         }
         X = OffscreenX();
@@ -619,22 +645,35 @@ std::wstring ImageFromPayload(const std::string& payload, const std::wstring& au
     return {};
 }
 
-// Finds the newest stored toast whose text contains both the title and the message, and returns its avatar.
-std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
-    if (!LoadSqlite()) {
-        return {};
-    }
+std::wstring NotificationFolder() {
     WCHAR localAppData[MAX_PATH];
     if (!GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData))) {
         return {};
     }
-    std::string path = ToUtf8(std::wstring(localAppData) + L"\\Microsoft\\Windows\\Notifications\\wpndatabase.db");
+    return std::wstring(localAppData) + L"\\Microsoft\\Windows\\Notifications";
+}
+
+sqlite3* OpenNotificationDb() {
+    std::wstring folder = NotificationFolder();
+    if (folder.empty() || !LoadSqlite()) {
+        return nullptr;
+    }
+    std::string path = ToUtf8(folder + L"\\wpndatabase.db");
     sqlite3* db = nullptr;
     if (g_sqlite.open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != 0) {
         Log(L"Opening the notification database failed");
         if (db) {
             g_sqlite.close(db);
         }
+        return nullptr;
+    }
+    return db;
+}
+
+// Finds the newest stored toast whose text contains both the title and the message, and returns its avatar.
+std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
+    sqlite3* db = OpenNotificationDb();
+    if (!db) {
         return {};
     }
     // Only the start of the message: the banner can show it with other line breaks or cut off (Firefox, Gmail).
@@ -700,6 +739,176 @@ std::wstring AppIcon(const std::wstring& app) {
     return icon;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Stored toasts: Windows shows one banner at a time and queues the rest (about 7 s each), but writes every toast
+// to the database at once. Cards are made from there, so toasts that come in a row show together.
+
+// Every <name ...>content</name> (self-closing ones with empty content): the opening tag and the content,
+// both still XML-escaped.
+std::vector<std::pair<std::string, std::string>> Elements(const std::string& xml, const char* name) {
+    std::vector<std::pair<std::string, std::string>> result;
+    std::string open = std::string("<") + name, close = std::string("</") + name + ">";
+    for (size_t at = 0; (at = xml.find(open, at)) != std::string::npos; at += open.size()) {
+        char next = at + open.size() < xml.size() ? xml[at + open.size()] : 0;
+        if (next != ' ' && next != '>' && next != '/') {
+            continue;  // <actions> when looking for <action>
+        }
+        size_t end = xml.find('>', at);
+        if (end == std::string::npos) {
+            break;
+        }
+        std::string content;
+        if (xml[end - 1] != '/') {
+            size_t stop = xml.find(close, end);
+            if (stop == std::string::npos) {
+                break;
+            }
+            content = xml.substr(end + 1, stop - end - 1);
+        }
+        result.push_back({xml.substr(at, end - at), content});
+    }
+    return result;
+}
+
+// The name Start shows for an app (also for desktop apps with an AppUserModelID), as the banner shows it.
+std::wstring AppName(const std::wstring& aumid) {
+    std::wstring name;
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName((L"shell:AppsFolder\\" + aumid).c_str(), nullptr, IID_PPV_ARGS(&item)))) {
+        PWSTR display = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &display)) && display) {
+            name = display;
+            CoTaskMemFree(display);
+        }
+        item->Release();
+    }
+    return name;
+}
+
+DWORD UserDword(const std::wstring& key, const wchar_t* name, DWORD missing) {
+    DWORD value = 0, size = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER, key.c_str(), name, RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS
+               ? value
+               : missing;
+}
+
+// Whether Windows shows a banner for the app's toasts: notifications on, the app's banners on, no Do not disturb
+// or full-screen app. Otherwise the toast only goes to the notification center, and gets no card either.
+bool BannerAllowed(const std::wstring& aumid) {
+    QUERY_USER_NOTIFICATION_STATE state;
+    if (SUCCEEDED(SHQueryUserNotificationState(&state)) && state != QUNS_ACCEPTS_NOTIFICATIONS && state != QUNS_APP) {
+        return false;
+    }
+    const std::wstring settings = L"Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings";
+    return UserDword(L"Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications", L"ToastEnabled", 1) &&
+           UserDword(settings, L"NOC_GLOBAL_SETTING_TOASTS_ENABLED", 1) &&
+           UserDword(settings + L"\\" + aumid, L"Enabled", 1) && UserDword(settings + L"\\" + aumid, L"ShowBanner", 1);
+}
+
+ToastInfo ToastFromPayload(const std::string& payload, const std::wstring& aumid) {
+    ToastInfo info;
+    std::vector<std::wstring> texts;
+    for (auto& [tag, content] : Elements(payload, "text")) {
+        if (!content.empty() && Attribute(tag, "placement") != "attribution") {
+            texts.push_back(FromUtf8(XmlUnescape(content)));
+        }
+    }
+    for (size_t i = 0; i < texts.size(); i++) {
+        if (i == 0) {
+            info.title = texts[0];
+        } else {
+            info.text += (i > 1 ? L"\n" : L"") + texts[i];
+        }
+    }
+    for (auto& [tag, content] : Elements(payload, "action")) {
+        if (Attribute(tag, "placement") != "contextMenu") {
+            info.buttons.push_back(FromUtf8(XmlUnescape(Attribute(tag, "content"))));
+        }
+    }
+    for (auto& [tag, content] : Elements(payload, "input")) {
+        if (Attribute(tag, "type") == "text") {
+            info.hasInput = true;
+            info.placeholder = FromUtf8(XmlUnescape(Attribute(tag, "placeHolderContent")));
+            break;
+        }
+    }
+    std::string scenario = Attribute(payload.substr(0, payload.find('>')), "scenario");
+    info.priority = scenario == "reminder" || scenario == "alarm" || scenario == "incomingCall" || scenario == "urgent";
+    info.app = AppName(aumid);
+    info.image = AvatarFromPayload(payload, aumid);
+    if (info.image.empty()) {
+        info.image = AppIcon(info.app);
+    }
+    return info;
+}
+
+std::string Column(sqlite3_stmt* stmt, int index) {
+    auto data = (const char*)g_sqlite.column_blob(stmt, index);
+    int size = g_sqlite.column_bytes(stmt, index);
+    return data && size > 0 ? std::string(data, size) : std::string();
+}
+
+// Toasts stored after lastOrder ([Order] grows with every stored notification, a replaced one included). The first
+// call (lastOrder -1) only finds where the table ends: older toasts came before the mod.
+std::vector<ToastInfo> NewStoredToasts(long long& lastOrder) {
+    std::vector<ToastInfo> result;
+    sqlite3* db = OpenNotificationDb();
+    if (!db) {
+        return result;
+    }
+    bool first = lastOrder < 0;
+    std::string sql = first ? "SELECT MAX([Order]) FROM Notification"
+                            : "SELECT n.[Order], n.Payload, h.PrimaryId FROM Notification n JOIN NotificationHandler h "
+                              "ON h.RecordId = n.HandlerId WHERE n.Type = 'toast' AND n.[Order] > " +
+                                  std::to_string(lastOrder) + " ORDER BY n.[Order]";
+    sqlite3_stmt* stmt = nullptr;
+    if (g_sqlite.prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == 0) {
+        while (g_sqlite.step(stmt) == SQLITE_ROW) {
+            long long order = atoll(Column(stmt, 0).c_str());
+            lastOrder = std::max(lastOrder, order);
+            if (first) {
+                break;
+            }
+            std::wstring aumid = FromUtf8(Column(stmt, 2));
+            if (!BannerAllowed(aumid)) {
+                continue;
+            }
+            ToastInfo info = ToastFromPayload(Column(stmt, 1), aumid);
+            if (info.title.empty() && info.text.empty()) {
+                continue;
+            }
+            info.id = L"stored#" + std::to_wstring(order);
+            result.push_back(info);
+        }
+        g_sqlite.finalize(stmt);
+    }
+    g_sqlite.close(db);
+    lastOrder = std::max(lastOrder, 0LL);
+    return result;
+}
+
+// Texts as compared between the database, the banner and the notification center: without the direction marks some
+// apps (Discord) put around names, and only the start of the message (the banner may cut or rewrap it).
+std::wstring Plain(const std::wstring& s) {
+    std::wstring r;
+    for (wchar_t c : s) {
+        if (c < 0x2066 || c > 0x2069) {
+            r += iswspace(c) ? L' ' : c;
+        }
+    }
+    size_t a = r.find_first_not_of(L' '), b = r.find_last_not_of(L' ');
+    return a == std::wstring::npos ? std::wstring() : r.substr(a, b - a + 1);
+}
+
+bool SameToast(const ToastInfo& info, const std::wstring& title, const std::wstring& text) {
+    if (Plain(info.title) != Plain(title)) {
+        return false;
+    }
+    std::wstring a = Plain(info.text), b = Plain(text);
+    size_t n = std::min({a.size(), b.size(), (size_t)24});
+    return a.compare(0, n, b, 0, n) == 0;
+}
+
 enum class Action { Open, Dismiss, Button, FocusInput };
 
 struct Command {
@@ -723,6 +932,7 @@ HWINEVENTHOOK g_eventHook = nullptr;  // owned by the card thread
 constexpr UINT WM_APP_SNAPSHOT = WM_APP + 1;
 constexpr UINT WM_APP_SETTINGS = WM_APP + 2;
 constexpr UINT WM_APP_REHOOK = WM_APP + 3;  // ShellExperienceHost restarted: watch the new process
+constexpr UINT WM_APP_CENTER = WM_APP + 4;  // wParam 1: the mod opens the notification center (keep it off the screen)
 // While a banner is up its toasts are re-read every kBannerMs (removed toasts), or every kTypingMs while its reply
 // box has the keyboard focus (the card mirrors the typed text). Showing, hiding and resizing the banner wake the
 // worker at once through window events. With no banner it sleeps and only checks every kIdleMs in case one was missed.
@@ -870,6 +1080,95 @@ void InvokeElement(IUIAutomationElement* element) {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Notification center: a toast still waiting in the banner's queue has no banner to click, but it is already in the
+// notification center, with the same buttons and reply box. The mod opens the center off the screen (Win+N; the
+// ShellExperienceHost copy moves it away, see SetWindowPos_Hook), acts there and closes it.
+
+void PressKeys(std::initializer_list<WORD> keys) {
+    std::vector<INPUT> inputs;
+    for (WORD key : keys) {
+        INPUT input{};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = key;
+        inputs.push_back(input);
+    }
+    for (size_t i = keys.size(); i-- > 0;) {
+        INPUT input = inputs[i];
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+        inputs.push_back(input);
+    }
+    SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
+}
+
+void SetCenterHidden(bool hidden) {
+    if (HWND window = g_window) {
+        SendMessageTimeoutW(window, WM_APP_CENTER, hidden, 0, SMTO_ABORTIFHUNG, 500, nullptr);
+    }
+}
+
+// The center takes the foreground while it is open.
+HWND ForegroundCenter() {
+    HWND hwnd = GetForegroundWindow();
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    return hwnd && pid == g_shellPid && IsCoreWindowClass(hwnd) && !IsBannerTitle(hwnd) ? hwnd : nullptr;
+}
+
+// Windows keeps the center where it last was and doesn't place it again when it opens, so the mod moves it back after
+// using it. Where it belongs: its last on-screen spot, or the right edge of the taskbar's monitor.
+int g_centerX = INT_MIN;
+
+int CenterHomeX(HWND hwnd) {
+    if (g_centerX != INT_MIN) {
+        return g_centerX;
+    }
+    RECT rc{};
+    GetWindowRect(hwnd, &rc);
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfo(MonitorFromWindow(FindWindowW(L"Shell_TrayWnd", nullptr), MONITOR_DEFAULTTOPRIMARY), &mi);
+    return mi.rcWork.right - (rc.right - rc.left);
+}
+
+// Puts the center back on the screen if it was left off it (also at load, after a crash or an old version).
+void RestoreCenter(HWND hwnd) {
+    RECT rc;
+    if (hwnd && GetWindowRect(hwnd, &rc) && rc.left >= OffscreenX() - 200) {
+        SetWindowPos(hwnd, nullptr, CenterHomeX(hwnd), rc.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+HWND OpenCenter() {
+    if (HWND hwnd = ForegroundCenter()) {
+        return hwnd;
+    }
+    SetCenterHidden(true);
+    PressKeys({VK_LWIN, 'N'});
+    for (int i = 0; i < 75 && !Stopping(); i++) {
+        if (HWND hwnd = ForegroundCenter()) {
+            RECT rc;
+            if (GetWindowRect(hwnd, &rc) && rc.left < OffscreenX() - 200) {
+                g_centerX = rc.left;
+                SetWindowPos(hwnd, nullptr, OffscreenX(), rc.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            return hwnd;
+        }
+        Sleep(20);
+    }
+    Log(L"The notification center didn't open");
+    SetCenterHidden(false);
+    return nullptr;
+}
+
+void CloseCenter(HWND hwnd) {
+    if (ForegroundCenter() == hwnd) {
+        PressKeys({VK_ESCAPE});
+        Sleep(300);  // closing animation, still off the screen
+    }
+    SetCenterHidden(false);
+    RestoreCenter(hwnd);
+}
+
 DWORD WINAPI WorkerThread(LPVOID) {
     if (!IsShellProcess() || FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
         return 0;
@@ -890,14 +1189,26 @@ DWORD WINAPI WorkerThread(LPVOID) {
                 uia2->put_TransactionTimeout(1000);
             }
         }
-        Com<IUIAutomationCondition> toastCondition;
-        {
+        auto classCondition = [&](const wchar_t* className, Com<IUIAutomationCondition>& condition) {
             VARIANT v{};
             v.vt = VT_BSTR;
-            v.bstrVal = SysAllocString(L"FlexibleToastView");
-            uia->CreatePropertyCondition(UIA_ClassNamePropertyId, v, toastCondition.put());
+            v.bstrVal = SysAllocString(className);
+            uia->CreatePropertyCondition(UIA_ClassNamePropertyId, v, condition.put());
             VariantClear(&v);
-        }
+        };
+        Com<IUIAutomationCondition> toastCondition;
+        classCondition(L"FlexibleToastView", toastCondition);
+        // The notification center: a list item per toast under a header per app.
+        Com<IUIAutomationCondition> itemCondition;
+        classCondition(L"ListViewItem", itemCondition);
+        Com<IUIAutomationCondition> headerCondition;
+        classCondition(L"ListViewHeaderItem", headerCondition);
+        Com<IUIAutomationCondition> contentCondition;
+        NewIdCondition(uia.p, L"Content", contentCondition);
+        Com<IUIAutomationCondition> moreCondition;
+        NewIdCondition(uia.p, L"SeeMoreLessButton", moreCondition);
+        Com<IUIAutomationCondition> expandCondition;
+        NewIdCondition(uia.p, L"ExpandButton", expandCondition);
         Com<IUIAutomationCondition> senderCondition;
         NewIdCondition(uia.p, L"SenderName", senderCondition);
         Com<IUIAutomationCondition> titleCondition;
@@ -917,9 +1228,34 @@ DWORD WINAPI WorkerThread(LPVOID) {
             ToastInfo info;
             std::wstring runtimeId;
             IUIAutomationElement* element;
+            bool hidden = false;  // its stored card already came and went: the banner shows it late, no second card
+            ULONGLONG until = 0;  // a stored toast's card time, kept when the banner takes it over (0: banner's time)
         };
         std::vector<Known> known;
         std::vector<ToastInfo> lastSent;
+
+        // Toasts from the database that the banner hasn't shown yet. Their cards last as long as a banner would;
+        // a toast the banner shows meanwhile continues the card and lives on with the banner.
+        struct Pending {
+            ToastInfo info;
+            ULONGLONG until;
+        };
+        std::vector<Pending> pending;
+        std::vector<std::pair<ToastInfo, ULONGLONG>> expired;  // card gone, banner not seen yet (and when)
+        long long lastOrder = -1;
+        NewStoredToasts(lastOrder);
+        auto cardMs = [] {
+            UINT seconds = 5;
+            SystemParametersInfoW(SPI_GETMESSAGEDURATION, 0, &seconds, 0);
+            return (ULONGLONG)seconds * 1000 + 1500;
+        };
+        // The database changes when a toast comes: that wakes the worker at once.
+        HANDLE dbChange = FindFirstChangeNotificationW(NotificationFolder().c_str(), FALSE,
+                                                       FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+        // A reply box in the notification center the user types into: the center stays open meanwhile.
+        HWND centerWindow = nullptr;
+        Com<IUIAutomationElement> centerEdit;
+        std::wstring centerId;
 
         auto findChildren = [](IUIAutomationElement* toast, IUIAutomationCondition* condition) {
             std::vector<IUIAutomationElement*> result;
@@ -942,11 +1278,152 @@ DWORD WINAPI WorkerThread(LPVOID) {
             }
         };
 
+        // The toast's item in the open notification center (AddRef'd), or nullptr.
+        auto centerItem = [&](IUIAutomationElement* root, const ToastInfo& info) {
+            IUIAutomationElement* found = nullptr;
+            auto items = findChildren(root, itemCondition.p);
+            for (auto item : items) {
+                if (!found && SameToast(info, ChildName(item, titleCondition.p), ChildName(item, contentCondition.p))) {
+                    found = item;
+                    found->AddRef();
+                }
+            }
+            release(items);
+            return found;
+        };
+        // Older toasts of an app are folded under its newest one ("Notifications (+3)").
+        auto unfold = [&](IUIAutomationElement* root, const std::wstring& app) {
+            auto headers = findChildren(root, headerCondition.p);
+            for (auto header : headers) {
+                if (Plain(ChildName(header, titleCondition.p)) == Plain(app)) {
+                    auto more = findChildren(header, moreCondition.p);
+                    for (auto button : more) {
+                        InvokeElement(button);
+                    }
+                    release(more);
+                }
+            }
+            release(headers);
+        };
+        auto endTyping = [&] {
+            if (centerEdit) {
+                centerEdit.put();
+                CloseCenter(centerWindow);
+                centerWindow = nullptr;
+                centerId.clear();
+            }
+        };
+        // Does the card's action in the notification center. False if the toast wasn't found there.
+        auto centerCommand = [&](const ToastInfo& info, const Command& command) {
+            HWND hwnd = centerEdit ? centerWindow : OpenCenter();
+            if (!hwnd) {
+                return false;
+            }
+            bool done = false;
+            Com<IUIAutomationElement> root;
+            if (SUCCEEDED(uia->ElementFromHandle(hwnd, root.put())) && root) {
+                IUIAutomationElement* item = nullptr;
+                // The list fills in a moment after opening.
+                for (int attempt = 0; attempt < 8 && !item && !Stopping(); attempt++) {
+                    if (attempt) {
+                        Sleep(150);
+                    }
+                    if (attempt == 3) {
+                        unfold(root.p, info.app);
+                        Sleep(250);
+                    }
+                    item = centerItem(root.p, info);
+                }
+                if (item && command.action == Action::Open) {
+                    InvokeElement(item);
+                    done = true;
+                } else if (item && command.action == Action::Dismiss) {
+                    auto targets = findChildren(item, dismissCondition.p);
+                    if (!targets.empty()) {
+                        InvokeElement(targets[0]);
+                        done = true;
+                    }
+                    release(targets);
+                } else if (item) {
+                    IUIAutomationCondition* condition =
+                        command.action == Action::Button ? verbCondition.p : editCondition.p;
+                    auto targets = findChildren(item, condition);
+                    if (targets.empty()) {
+                        // Buttons and the reply box show only when the item is expanded.
+                        auto expand = findChildren(item, expandCondition.p);
+                        if (!expand.empty()) {
+                            InvokeElement(expand[0]);
+                            Sleep(300);
+                            // Expanding builds the item anew: the old element has no reply box to focus.
+                            if (IUIAutomationElement* fresh = centerItem(root.p, info)) {
+                                item->Release();
+                                item = fresh;
+                            }
+                            targets = findChildren(item, condition);
+                        }
+                        release(expand);
+                    }
+                    int index = command.action == Action::Button ? command.index : 0;
+                    if (index < (int)targets.size()) {
+                        if (command.action == Action::Button) {
+                            InvokeElement(targets[index]);
+                        } else {
+                            // The center puts its own focus (Do not disturb) once it has opened, which can come
+                            // after this: focus again until the reply box keeps it.
+                            bool focused = false;
+                            for (int attempt = 0; attempt < 10 && !focused && !Stopping(); attempt++) {
+                                targets[index]->SetFocus();
+                                Sleep(150);
+                                Com<IUIAutomationElement> focusedElement;
+                                BSTR focusedId = nullptr;
+                                if (SUCCEEDED(uia->GetFocusedElement(focusedElement.put())) && focusedElement &&
+                                    SUCCEEDED(focusedElement->get_CurrentAutomationId(&focusedId)) && focusedId) {
+                                    focused = wcscmp(focusedId, L"Edit") == 0;
+                                }
+                                SysFreeString(focusedId);
+                            }
+                            if (!focused) {
+                                Log(L"The center's reply box didn't take the focus");
+                            }
+                            centerEdit.put();
+                            centerEdit.p = targets[index];
+                            centerEdit.p->AddRef();
+                            centerWindow = hwnd;
+                            centerId = info.id;
+                        }
+                        done = true;
+                    }
+                    release(targets);
+                }
+                if (item) {
+                    item->Release();
+                }
+            }
+            Log(L"Center %s %d: %s", done ? L"did" : L"didn't find", (int)command.action, info.title.c_str());
+            if (command.action != Action::FocusInput) {
+                if (centerEdit) {
+                    endTyping();  // e.g. Send after typing
+                } else {
+                    CloseCenter(hwnd);
+                }
+            } else if (!done) {
+                CloseCenter(hwnd);
+            }
+            return done;
+        };
+
         bool busy = true;     // a banner was up on the last pass (or this is the first pass)
         bool typing = false;  // a reply box had the keyboard focus on the last pass
-        HANDLE waits[] = {g_stopEvent, g_wakeEvent};
-        while (WaitForMultipleObjects(2, waits, FALSE, typing ? kTypingMs : busy ? kBannerMs : kIdleMs) !=
-               WAIT_OBJECT_0) {
+        HANDLE waits[] = {g_stopEvent, g_wakeEvent, dbChange};
+        DWORD waitCount = dbChange != INVALID_HANDLE_VALUE ? 3 : 2;
+        DWORD woke;
+        while ((woke = WaitForMultipleObjects(waitCount, waits, FALSE,
+                                              typing                     ? kTypingMs
+                                              : busy || !pending.empty() ? kBannerMs
+                                                                         : kIdleMs)) != WAIT_OBJECT_0) {
+            if (woke == WAIT_OBJECT_0 + 2) {
+                FindNextChangeNotification(dbChange);
+            }
             if (!busy) {
                 // ShellExperienceHost restarts (or starts late): its window events need a new hook.
                 DWORD pid = BannerProcess();
@@ -972,6 +1449,9 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                                         : command.action == Action::Button ? verbCondition.p
                                                         : command.action == Action::FocusInput ? editCondition.p
                                                                                                : nullptr;
+                    if (command.action != Action::FocusInput) {
+                        k.until = 0;  // handled: its card goes with the banner
+                    }
                     if (!condition) {
                         InvokeElement(k.element);
                         continue;
@@ -988,7 +1468,71 @@ DWORD WINAPI WorkerThread(LPVOID) {
                     }
                     release(targets);
                 }
+                // A stored toast still waiting for the banner: through the notification center.
+                bool onBanner = std::any_of(known.begin(), known.end(),
+                                            [&](const Known& k) { return k.info.id == command.id; });
+                auto waiting = std::find_if(pending.begin(), pending.end(),
+                                            [&](const Pending& p) { return p.info.id == command.id; });
+                if (!onBanner && waiting != pending.end()) {
+                    ToastInfo info = waiting->info;
+                    bool done = centerCommand(info, command);
+                    // Opened, dismissed or a button pressed: the toast is handled, its card goes.
+                    if (done && command.action != Action::FocusInput) {
+                        auto it = std::find_if(pending.begin(), pending.end(),
+                                               [&](const Pending& p) { return p.info.id == info.id; });
+                        if (it != pending.end()) {
+                            expired.push_back({it->info, GetTickCount64()});
+                            pending.erase(it);
+                        }
+                    }
+                }
             }
+
+            // New stored toasts (the same pass reads the banner after this, so a toast shown at once is matched).
+            ULONGLONG now = GetTickCount64();
+            for (auto& info : NewStoredToasts(lastOrder)) {
+                bool shown = std::any_of(known.begin(), known.end(),
+                                         [&](const Known& k) { return SameToast(info, k.info.title, k.info.text); });
+                Log(L"Stored toast %s: %s / %s%s", info.app.c_str(), info.title.c_str(), info.text.c_str(),
+                    shown ? L" (already on the banner)" : L"");
+                if (!shown) {
+                    pending.push_back({info, now + cardMs()});
+                }
+            }
+            // The reply box in the center: mirrored on the card while focused; leaving it closes the center.
+            if (centerEdit) {
+                auto it = std::find_if(pending.begin(), pending.end(),
+                                       [&](const Pending& p) { return p.info.id == centerId; });
+                // Off the screen the reply box doesn't report the keyboard focus; the center keeps it while open.
+                BOOL focused = ForegroundCenter() == centerWindow;
+                if (it != pending.end()) {
+                    Com<IUIAutomationValuePattern> value;
+                    BSTR text = nullptr;
+                    if (SUCCEEDED(centerEdit->GetCurrentPatternAs(UIA_ValuePatternId,
+                                                                  __uuidof(IUIAutomationValuePattern),
+                                                                  reinterpret_cast<void**>(value.put()))) &&
+                        value && SUCCEEDED(value->get_CurrentValue(&text))) {
+                        it->info.inputValue = text ? text : L"";
+                        SysFreeString(text);
+                    }
+                    it->info.inputFocused = focused != FALSE;
+                    it->until = std::max(it->until, now + cardMs());  // typing keeps the card
+                }
+                if (!focused || it == pending.end()) {
+                    Log(L"Typing in the center ended (%s)", focused ? L"card gone" : L"center closed");
+                    endTyping();
+                }
+            }
+            for (auto it = pending.begin(); it != pending.end();) {
+                // Priority toasts (reminders, calls) wait for the banner, which keeps them until handled.
+                if (now < it->until || (it->info.priority && now < it->until + 10 * 60 * 1000)) {
+                    ++it;
+                    continue;
+                }
+                expired.push_back({it->info, now});
+                it = pending.erase(it);
+            }
+            std::erase_if(expired, [&](const auto& e) { return now - e.second > 5 * 60 * 1000; });
 
             std::vector<Known> current;
             HWND banner = FindVisibleBanner();
@@ -1015,8 +1559,12 @@ DWORD WINAPI WorkerThread(LPVOID) {
                         // element and its runtimeId stay, only the texts change, so they are compared every pass.
                         std::wstring title = ChildName(element, titleCondition.p);
                         std::wstring text = ChildName(element, textCondition.p);
+                        bool hidden = false;
+                        ULONGLONG until = 0;
                         if (same != known.end() && same->info.title == title && same->info.text == text) {
                             info = same->info;
+                            hidden = same->hidden;
+                            until = same->until;
                         } else {
                             info.app = same != known.end() ? same->info.app : ChildName(element, senderCondition.p);
                             info.title = title;
@@ -1030,12 +1578,33 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                 return k.info.id.rfind(key, 0) == 0;
                             });
                             info.id = key + std::to_wstring(n);
+                            // A stored toast reaching the banner: the card it already has goes on (or, if that card
+                            // is gone, none comes back).
+                            std::wstring image;
+                            auto waiting = std::find_if(pending.begin(), pending.end(), [&](const Pending& p) {
+                                return SameToast(p.info, title, text);
+                            });
+                            auto gone = std::find_if(expired.begin(), expired.end(), [&](const auto& e) {
+                                return SameToast(e.first, title, text);
+                            });
+                            if (waiting != pending.end()) {
+                                info.id = waiting->info.id;
+                                image = waiting->info.image;
+                                until = waiting->until;
+                                pending.erase(waiting);
+                            } else if (gone != expired.end()) {
+                                info.id = gone->first.id;
+                                hidden = true;
+                                expired.erase(gone);
+                            }
                             auto old = std::find_if(known.begin(), known.end(),
                                                     [&](const Known& k) { return k.info.id == info.id; });
                             if (old != known.end()) {
                                 info = old->info;
+                                hidden = old->hidden;
+                                until = old->until;
                             } else {
-                                info.image = FindAvatar(info.title, info.text);
+                                info.image = !image.empty() ? image : FindAvatar(info.title, info.text);
                                 if (info.image.empty()) {
                                     info.image = AppIcon(info.app);
                                 }
@@ -1055,9 +1624,12 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                 info.hasInput = !edits.empty();
                                 release(edits);
                                 info.placeholder = ChildName(element, editCondition.p);
-                                Log(L"Toast %s: %s / %s [%s] %d buttons%s", info.app.c_str(), info.title.c_str(),
+                                Log(L"Toast %s: %s / %s [%s] %d buttons%s%s", info.app.c_str(), info.title.c_str(),
                                     info.text.c_str(), info.image.c_str(), (int)info.buttons.size(),
-                                    info.hasInput ? L", reply box" : L"");
+                                    info.hasInput ? L", reply box" : L"",
+                                    hidden                              ? L" (its card already went)"
+                                    : info.id.rfind(L"stored#", 0) == 0 ? L" (continues its card)"
+                                                                        : L"");
                             }
                         }
                         // The reply box changes while typing: its text and focus are read on every pass.
@@ -1079,11 +1651,22 @@ DWORD WINAPI WorkerThread(LPVOID) {
                             }
                             release(edits);
                         }
-                        current.push_back({info, runtimeId, element});
+                        // Its card ends on time, unless the user is typing in it or it waits to be handled.
+                        if (until && GetTickCount64() > until && !info.inputFocused && !info.priority) {
+                            hidden = true;
+                        }
+                        current.push_back({info, runtimeId, element, hidden, until});
                     }
                 }
             }
             for (auto& k : known) {
+                // The banner drops a toast before its card's time is up when the notification center opens (the
+                // mod's own Win+N too): the card stays, now acting through the center.
+                bool kept = std::any_of(current.begin(), current.end(),
+                                        [&](const Known& c) { return c.info.id == k.info.id; });
+                if (!kept && k.until && !k.hidden && GetTickCount64() < k.until) {
+                    pending.push_back({k.info, k.until});
+                }
                 k.element->Release();
             }
             known.swap(current);
@@ -1094,8 +1677,14 @@ DWORD WINAPI WorkerThread(LPVOID) {
             std::vector<ToastInfo> infos;
             typing = false;
             for (auto& k : known) {
-                infos.push_back(k.info);
-                typing = typing || k.info.inputFocused;
+                if (!k.hidden) {
+                    infos.push_back(k.info);
+                    typing = typing || k.info.inputFocused;
+                }
+            }
+            for (auto& p : pending) {
+                infos.push_back(p.info);
+                typing = typing || p.info.inputFocused;
             }
             bool changed = infos.size() != lastSent.size() ||
                            !std::equal(infos.begin(), infos.end(), lastSent.begin(), [](const ToastInfo& a, const ToastInfo& b) {
@@ -1114,6 +1703,10 @@ DWORD WINAPI WorkerThread(LPVOID) {
         }
         for (auto& k : known) {
             k.element->Release();
+        }
+        endTyping();
+        if (dbChange != INVALID_HANDLE_VALUE) {
+            FindCloseChangeNotification(dbChange);
         }
     }
     CoUninitialize();
@@ -1867,6 +2460,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER:
             Redraw();
             return 0;
+        case WM_APP_CENTER:
+            SetWindowTextW(hwnd, wParam ? kCenterTitle : kCardTitle);
+            return 0;
         case WM_APP_REHOOK:
             if (g_eventHook) {
                 UnhookWinEvent(g_eventHook);
@@ -2031,7 +2627,7 @@ DWORD WINAPI UiThread(LPVOID) {
         Log(L"Registering the window class failed (%lu)", GetLastError());
     } else {
         g_window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kWindowClass,
-                                   L"Compact Notifications", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+                                   kCardTitle, WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
         Log(L"Card window %p (error %lu)", g_window.load(), g_window ? 0 : GetLastError());
         // Out-of-context window events arrive through this thread's message loop.
         g_eventHook = HookBannerEvents();
@@ -2089,8 +2685,6 @@ void StopCards() {
 // Process roles: ShellExperienceHost only hides the banner; explorer hides it too (some builds move it from there),
 // and the shell's explorer also reads the toasts and draws the cards (IsShellProcess). Windhawk's separate "tool mod"
 // process didn't survive reloads, and explorer is always running anyway.
-
-bool g_explorer = false;
 
 BOOL Wh_ModInit() {
     WCHAR path[MAX_PATH];
