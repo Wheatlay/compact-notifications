@@ -25,8 +25,9 @@ Windhawk mod that replaces Windows toast banners with custom cards in a compact 
   the toast there (unfolding the app's group, expanding the toast for its buttons and reply box), clicks or focuses
   the same element and closes the center again. Windows doesn't place the center again when it opens, so the mod
   moves it back to where it was.
-- The banner's own close button doesn't react to UI Automation (tested on 05.11.2026), so × on a card whose toast is on
-  the banner may not close it there.
+- × only closes the card; the toast stays in the notification center. For a queued toast nothing is sent to Windows.
+  (The banner's own close button, which the mod invokes for a banner toast, doesn't react to UI Automation anyway,
+  tested on 05.11.2026.)
 
 ## Development without the editor
 

@@ -1495,7 +1495,8 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                             [&](const Pending& p) { return p.info.id == command.id; });
                 if (!onBanner && waiting != pending.end()) {
                     ToastInfo info = waiting->info;
-                    bool done = centerCommand(info, command);
+                    // × only closes the card; the toast stays in the notification center (as for banner toasts).
+                    bool done = command.action == Action::Dismiss || centerCommand(info, command);
                     // Opened, dismissed or a button pressed: the toast is handled, its card goes.
                     if (done && command.action != Action::FocusInput) {
                         auto it = std::find_if(pending.begin(), pending.end(),
