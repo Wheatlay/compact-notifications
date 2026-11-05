@@ -20,9 +20,12 @@ Windhawk mod that replaces Windows toast banners with custom cards in a compact 
 - Drawing: a layered, never-activated window in one `explorer.exe` process (Direct2D/DirectWrite/WIC). Click and
   × go through UI Automation to the banner, so the app gets its real action. Windhawk's separate "tool mod" process
   was tried first, but it didn't come back after a reload.
+- Replies are typed on the card itself (the card window takes the keyboard while its reply box is focused). The text
+  goes into the toast's reply box (UI Automation `SetValue`) right before the button is pressed, on the banner or in
+  the notification center, so typing never waits for a hidden window.
 - Actions on a card whose toast still waits in the queue (no banner yet): the mod opens the notification center
   with Win+N, kept off the screen (the card window's title tells the `ShellExperienceHost` hook to move it), finds
-  the toast there (unfolding the app's group, expanding the toast for its buttons and reply box), clicks or focuses
+  the toast there (unfolding the app's group, expanding the toast for its buttons and reply box), clicks
   the same element and closes the center again. Windows doesn't place the center again when it opens, so the mod
   moves it back to where it was.
 - × only closes the card; the toast stays in the notification center. For a queued toast nothing is sent to Windows.

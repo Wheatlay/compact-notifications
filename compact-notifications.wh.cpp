@@ -29,8 +29,8 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
 * **Click** a card to do what clicking the original notification does (open the app or the conversation).
 * **×** (on hover) closes the card; the notification stays in the notification center.
 * **Buttons** from the notification (for example *Reply*, *Snooze*, *Dismiss*) are shown under the text.
-* **Reply box**: click it and type, then press the app's send button. The text goes to the original reply
-  box, so the app receives it as usual.
+* **Reply box**: click it and type, then press the app's send button (or Enter). The text goes into the
+  original reply box together with the button press, so the app receives it as usual.
 * **Avatars**: the notification's image (local files and images from Store apps), or a thumbnail of its
   large picture (e.g. a screenshot); otherwise the app's registered icon (e.g. Firefox), and the first
   letter of the app as the last resort. Web images aren't downloaded.
@@ -70,8 +70,8 @@ banners back.
 * Firefox doesn't store its notifications in the database, so its cards still come one after another.
 * While a full-screen app or *Do not disturb* is on, Windows doesn't show notifications at all, so there are
   no cards either.
-* The reply box on a card shows the typed text with the caret at the end; moving the caret with the arrow
-  keys or selecting text works, but isn't shown on the card.
+* The reply box on a card is simple: typing, Backspace, Ctrl+Backspace, Ctrl+V, Enter to send and Esc; no
+  caret movement or selection.
 */
 // ==/WindhawkModReadme==
 
@@ -444,7 +444,7 @@ struct ToastInfo {
     std::vector<std::wstring> buttons;
     bool hasInput = false;
     std::wstring placeholder;
-    std::wstring inputValue;  // what has been typed into the (hidden) banner's reply box
+    std::wstring inputValue;  // the reply typed on the card (the card thread's own state)
     bool inputFocused = false;
     bool priority = false;  // reminders, alarms, calls: they stay until handled
 };
@@ -911,12 +911,13 @@ bool SameToast(const ToastInfo& info, const std::wstring& title, const std::wstr
     return a.compare(0, n, b, 0, n) == 0;
 }
 
-enum class Action { Open, Dismiss, Button, FocusInput };
+enum class Action { Open, Dismiss, Button };
 
 struct Command {
-    std::wstring id;
+    ToastInfo info;  // the card's toast: found by id on the banner, by title and text in the notification center
     Action action;
-    int index = 0;  // which button
+    int index = 0;      // which button
+    std::wstring reply;  // typed on the card: put into the toast's reply box before the button is pressed
 };
 
 std::mutex g_mutex;
@@ -935,10 +936,10 @@ constexpr UINT WM_APP_SNAPSHOT = WM_APP + 1;
 constexpr UINT WM_APP_SETTINGS = WM_APP + 2;
 constexpr UINT WM_APP_REHOOK = WM_APP + 3;  // ShellExperienceHost restarted: watch the new process
 constexpr UINT WM_APP_CENTER = WM_APP + 4;  // wParam 1: the mod opens the notification center (keep it off the screen)
-// While a banner is up its toasts are re-read every kBannerMs (removed toasts), or every kTypingMs while its reply
-// box has the keyboard focus (the card mirrors the typed text). Showing, hiding and resizing the banner wake the
-// worker at once through window events. With no banner it sleeps and only checks every kIdleMs in case one was missed.
-constexpr DWORD kTypingMs = 100, kBannerMs = 500, kIdleMs = 2000;
+// While a banner or a stored toast's card is up, the worker passes every kBannerMs (removed toasts, new stored ones,
+// cards running out). Showing, hiding and resizing the banner wake the worker at once through window events. With
+// nothing up it sleeps and only checks every kIdleMs in case something was missed.
+constexpr DWORD kBannerMs = 500, kIdleMs = 2000;
 
 // The banner window: the persistent one (any size) or only while it shows a toast.
 HWND FindBanner(bool showing) {
@@ -1267,11 +1268,6 @@ DWORD WINAPI WorkerThread(LPVOID) {
         // The database changes when a toast comes: that wakes the worker at once.
         HANDLE dbChange = FindFirstChangeNotificationW(NotificationFolder().c_str(), FALSE,
                                                        FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
-        // A reply box in the notification center the user types into: the center stays open meanwhile.
-        HWND centerWindow = nullptr;
-        Com<IUIAutomationElement> centerEdit;
-        std::wstring centerId;
-
         auto findChildren = [](IUIAutomationElement* toast, IUIAutomationCondition* condition) {
             std::vector<IUIAutomationElement*> result;
             Com<IUIAutomationElementArray> array;
@@ -1320,17 +1316,38 @@ DWORD WINAPI WorkerThread(LPVOID) {
             }
             release(headers);
         };
-        auto endTyping = [&] {
-            if (centerEdit) {
-                centerEdit.put();
-                CloseCenter(centerWindow);
-                centerWindow = nullptr;
-                centerId.clear();
+        // Presses a button of a toast (banner or notification center), first putting the reply typed on the card
+        // into the toast's reply box.
+        auto pressButton = [&](IUIAutomationElement* toast, const Command& command) {
+            if (!command.reply.empty()) {
+                auto edits = findChildren(toast, editCondition.p);
+                Com<IUIAutomationValuePattern> value;
+                bool filled = false;
+                if (!edits.empty() &&
+                    SUCCEEDED(edits[0]->GetCurrentPatternAs(UIA_ValuePatternId, __uuidof(IUIAutomationValuePattern),
+                                                            reinterpret_cast<void**>(value.put()))) &&
+                    value) {
+                    BSTR text = SysAllocString(command.reply.c_str());
+                    value->SetValue(text);
+                    SysFreeString(text);
+                    BSTR now = nullptr;
+                    filled = SUCCEEDED(value->get_CurrentValue(&now)) && now && command.reply == now;
+                    SysFreeString(now);
+                }
+                Log(L"Reply %s", filled ? L"put into the toast's reply box" : L"NOT put into the reply box");
+                release(edits);
             }
+            auto buttons = findChildren(toast, verbCondition.p);
+            bool done = command.index < (int)buttons.size();
+            if (done) {
+                InvokeElement(buttons[command.index]);
+            }
+            release(buttons);
+            return done;
         };
         // Does the card's action in the notification center. False if the toast wasn't found there.
         auto centerCommand = [&](const ToastInfo& info, const Command& command) {
-            HWND hwnd = centerEdit ? centerWindow : OpenCenter();
+            HWND hwnd = OpenCenter();
             if (!hwnd) {
                 return false;
             }
@@ -1360,83 +1377,39 @@ DWORD WINAPI WorkerThread(LPVOID) {
                     }
                     release(targets);
                 } else if (item) {
-                    IUIAutomationCondition* condition =
-                        command.action == Action::Button ? verbCondition.p : editCondition.p;
-                    auto targets = findChildren(item, condition);
-                    if (targets.empty()) {
-                        // Buttons and the reply box show only when the item is expanded.
+                    // Buttons and the reply box show only when the item is expanded, which builds it anew.
+                    auto verbs = findChildren(item, verbCondition.p);
+                    if (verbs.empty()) {
                         auto expand = findChildren(item, expandCondition.p);
                         if (!expand.empty()) {
                             InvokeElement(expand[0]);
                             Sleep(300);
-                            // Expanding builds the item anew: the old element has no reply box to focus.
                             if (IUIAutomationElement* fresh = centerItem(root.p, info)) {
                                 item->Release();
                                 item = fresh;
                             }
-                            targets = findChildren(item, condition);
                         }
                         release(expand);
                     }
-                    int index = command.action == Action::Button ? command.index : 0;
-                    if (index < (int)targets.size()) {
-                        if (command.action == Action::Button) {
-                            InvokeElement(targets[index]);
-                        } else {
-                            // The center puts its own focus (Do not disturb) once it has opened, which can come
-                            // after this: focus again until the reply box keeps it.
-                            bool focused = false;
-                            for (int attempt = 0; attempt < 10 && !focused && !Stopping(); attempt++) {
-                                targets[index]->SetFocus();
-                                Sleep(150);
-                                Com<IUIAutomationElement> focusedElement;
-                                BSTR focusedId = nullptr;
-                                if (SUCCEEDED(uia->GetFocusedElement(focusedElement.put())) && focusedElement &&
-                                    SUCCEEDED(focusedElement->get_CurrentAutomationId(&focusedId)) && focusedId) {
-                                    focused = wcscmp(focusedId, L"Edit") == 0;
-                                }
-                                SysFreeString(focusedId);
-                            }
-                            if (!focused) {
-                                Log(L"The center's reply box didn't take the focus");
-                            }
-                            centerEdit.put();
-                            centerEdit.p = targets[index];
-                            centerEdit.p->AddRef();
-                            centerWindow = hwnd;
-                            centerId = info.id;
-                        }
-                        done = true;
-                    }
-                    release(targets);
+                    release(verbs);
+                    done = pressButton(item, command);
                 }
                 if (item) {
                     item->Release();
                 }
             }
             Log(L"Center %s %d: %s", done ? L"did" : L"didn't find", (int)command.action, info.title.c_str());
-            if (command.action != Action::FocusInput) {
-                if (centerEdit) {
-                    endTyping();  // e.g. Send after typing
-                } else {
-                    CloseCenter(hwnd);
-                }
-            } else if (!done) {
-                CloseCenter(hwnd);
-            }
+            CloseCenter(hwnd);
             return done;
         };
 
-        bool busy = true;     // a banner was up on the last pass (or this is the first pass)
-        bool typing = false;  // a reply box had the keyboard focus on the last pass
+        bool busy = true;  // a banner was up on the last pass (or this is the first pass)
         bool centerChecked = false;
         HANDLE waits[] = {g_stopEvent, g_wakeEvent, dbChange};
         DWORD waitCount = dbChange != INVALID_HANDLE_VALUE ? 3 : 2;
         DWORD woke;
         while ((woke = WaitForMultipleObjects(waitCount, waits, FALSE,
-                                              typing                     ? kTypingMs
-                                              : busy || !pending.empty() ? kBannerMs
-                                                                         : kIdleMs)) != WAIT_OBJECT_0) {
+                                              busy || !pending.empty() ? kBannerMs : kIdleMs)) != WAIT_OBJECT_0) {
             if (woke == WAIT_OBJECT_0 + 2) {
                 FindNextChangeNotification(dbChange);
             }
@@ -1461,51 +1434,33 @@ DWORD WINAPI WorkerThread(LPVOID) {
                 if (Stopping()) {
                     break;
                 }
-                for (auto& k : known) {
-                    if (k.info.id != command.id) {
-                        continue;
-                    }
-                    IUIAutomationCondition* condition = command.action == Action::Dismiss  ? dismissCondition.p
-                                                        : command.action == Action::Button ? verbCondition.p
-                                                        : command.action == Action::FocusInput ? editCondition.p
-                                                                                               : nullptr;
-                    if (command.action != Action::FocusInput) {
-                        k.until = 0;  // handled: its card goes with the banner
-                    }
-                    if (!condition) {
-                        InvokeElement(k.element);
-                        continue;
-                    }
-                    auto targets = findChildren(k.element, condition);
-                    int index = command.action == Action::Button ? command.index : 0;
-                    if (index < (int)targets.size()) {
-                        if (command.action == Action::FocusInput) {
-                            // Typing then goes straight to the hidden banner's reply box; the card shows its text.
-                            targets[index]->SetFocus();
-                        } else {
-                            InvokeElement(targets[index]);
+                const std::wstring& id = command.info.id;
+                auto onBanner = std::find_if(known.begin(), known.end(), [&](const Known& k) { return k.info.id == id; });
+                if (onBanner != known.end()) {
+                    onBanner->until = 0;  // handled: its card goes with the banner
+                    if (command.action == Action::Button) {
+                        pressButton(onBanner->element, command);
+                    } else if (command.action == Action::Dismiss) {
+                        auto targets = findChildren(onBanner->element, dismissCondition.p);
+                        if (!targets.empty()) {
+                            InvokeElement(targets[0]);
                         }
+                        release(targets);
+                    } else {
+                        InvokeElement(onBanner->element);
                     }
-                    release(targets);
+                    continue;
                 }
-                // A stored toast still waiting for the banner: through the notification center.
-                bool onBanner = std::any_of(known.begin(), known.end(),
-                                            [&](const Known& k) { return k.info.id == command.id; });
+                // Not on the banner (still queued, or the banner already let it go): through the notification
+                // center. × only closes the card, the toast stays there (as for banner toasts).
+                if (command.action != Action::Dismiss) {
+                    centerCommand(command.info, command);
+                }
                 auto waiting = std::find_if(pending.begin(), pending.end(),
-                                            [&](const Pending& p) { return p.info.id == command.id; });
-                if (!onBanner && waiting != pending.end()) {
-                    ToastInfo info = waiting->info;
-                    // × only closes the card; the toast stays in the notification center (as for banner toasts).
-                    bool done = command.action == Action::Dismiss || centerCommand(info, command);
-                    // Opened, dismissed or a button pressed: the toast is handled, its card goes.
-                    if (done && command.action != Action::FocusInput) {
-                        auto it = std::find_if(pending.begin(), pending.end(),
-                                               [&](const Pending& p) { return p.info.id == info.id; });
-                        if (it != pending.end()) {
-                            expired.push_back({it->info, GetTickCount64()});
-                            pending.erase(it);
-                        }
-                    }
+                                            [&](const Pending& p) { return p.info.id == id; });
+                if (waiting != pending.end()) {
+                    expired.push_back({waiting->info, GetTickCount64()});
+                    pending.erase(waiting);
                 }
             }
 
@@ -1526,30 +1481,6 @@ DWORD WINAPI WorkerThread(LPVOID) {
                     shown ? L" (already on the banner)" : L"");
                 if (!shown) {
                     pending.push_back({info, now + cardMs()});
-                }
-            }
-            // The reply box in the center: mirrored on the card while focused; leaving it closes the center.
-            if (centerEdit) {
-                auto it = std::find_if(pending.begin(), pending.end(),
-                                       [&](const Pending& p) { return p.info.id == centerId; });
-                // Off the screen the reply box doesn't report the keyboard focus; the center keeps it while open.
-                BOOL focused = ForegroundCenter() == centerWindow;
-                if (it != pending.end()) {
-                    Com<IUIAutomationValuePattern> value;
-                    BSTR text = nullptr;
-                    if (SUCCEEDED(centerEdit->GetCurrentPatternAs(UIA_ValuePatternId,
-                                                                  __uuidof(IUIAutomationValuePattern),
-                                                                  reinterpret_cast<void**>(value.put()))) &&
-                        value && SUCCEEDED(value->get_CurrentValue(&text))) {
-                        it->info.inputValue = text ? text : L"";
-                        SysFreeString(text);
-                    }
-                    it->info.inputFocused = focused != FALSE;
-                    it->until = std::max(it->until, now + cardMs());  // typing keeps the card
-                }
-                if (!focused || it == pending.end()) {
-                    Log(L"Typing in the center ended (%s)", focused ? L"card gone" : L"center closed");
-                    endTyping();
                 }
             }
             for (auto it = pending.begin(); it != pending.end();) {
@@ -1661,27 +1592,9 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                                                         : L"");
                             }
                         }
-                        // The reply box changes while typing: its text and focus are read on every pass.
-                        if (info.hasInput) {
-                            auto edits = findChildren(element, editCondition.p);
-                            if (!edits.empty()) {
-                                Com<IUIAutomationValuePattern> value;
-                                BSTR text = nullptr;
-                                if (SUCCEEDED(edits[0]->GetCurrentPatternAs(UIA_ValuePatternId,
-                                                                            __uuidof(IUIAutomationValuePattern),
-                                                                            reinterpret_cast<void**>(value.put()))) &&
-                                    value && SUCCEEDED(value->get_CurrentValue(&text))) {
-                                    info.inputValue = text ? text : L"";
-                                    SysFreeString(text);
-                                }
-                                BOOL focused = FALSE;
-                                edits[0]->get_CurrentHasKeyboardFocus(&focused);
-                                info.inputFocused = focused != FALSE;
-                            }
-                            release(edits);
-                        }
-                        // Its card ends on time, unless the user is typing in it or it waits to be handled.
-                        if (until && GetTickCount64() > until && !info.inputFocused && !info.priority) {
+                        // Its card ends on time unless it waits to be handled (the card keeps itself while the user
+                        // types in it).
+                        if (until && GetTickCount64() > until && !info.priority) {
                             hidden = true;
                         }
                         current.push_back({info, runtimeId, element, hidden, until});
@@ -1704,21 +1617,17 @@ DWORD WINAPI WorkerThread(LPVOID) {
             }
 
             std::vector<ToastInfo> infos;
-            typing = false;
             for (auto& k : known) {
                 if (!k.hidden) {
                     infos.push_back(k.info);
-                    typing = typing || k.info.inputFocused;
                 }
             }
             for (auto& p : pending) {
                 infos.push_back(p.info);
-                typing = typing || p.info.inputFocused;
             }
             bool changed = infos.size() != lastSent.size() ||
-                           !std::equal(infos.begin(), infos.end(), lastSent.begin(), [](const ToastInfo& a, const ToastInfo& b) {
-                               return a.id == b.id && a.inputValue == b.inputValue && a.inputFocused == b.inputFocused;
-                           });
+                           !std::equal(infos.begin(), infos.end(), lastSent.begin(),
+                                       [](const ToastInfo& a, const ToastInfo& b) { return a.id == b.id; });
             if (changed) {
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
@@ -1733,7 +1642,6 @@ DWORD WINAPI WorkerThread(LPVOID) {
         for (auto& k : known) {
             k.element->Release();
         }
-        endTyping();
         if (dbChange != INVALID_HANDLE_VALUE) {
             FindCloseChangeNotification(dbChange);
         }
@@ -2143,14 +2051,11 @@ void ApplySnapshot() {
     }
     ULONGLONG now = NowMs();
     for (auto& card : g_cards) {
-        auto live = std::find_if(snapshot.begin(), snapshot.end(), [&](const ToastInfo& t) { return t.id == card.info.id; });
-        if (live == snapshot.end()) {
-            if (!card.goneAt) {
-                card.goneAt = now;
-            }
-        } else {
-            card.info.inputValue = live->inputValue;
-            card.info.inputFocused = live->inputFocused;
+        // A card being typed into stays until the typing ends (EndTyping applies the snapshot again).
+        bool live = card.info.inputFocused ||
+                    std::any_of(snapshot.begin(), snapshot.end(), [&](const ToastInfo& t) { return t.id == card.info.id; });
+        if (!live && !card.goneAt) {
+            card.goneAt = now;
         }
     }
     // Toasts that get no card (muted apps, cards pushed out by "Most cards at once") are remembered while the
@@ -2320,7 +2225,7 @@ void DrawCard(Card& card, int index, float x, float alpha) {
         ink->Release();
     }
 
-    // Reply box: shows what is typed into the hidden banner's box, with a caret while it has the keyboard.
+    // Reply box: what is typed on the card, with a caret while it has the keyboard.
     if (card.info.hasInput) {
         D2D1_RECT_F box = Offset(InputRect(card), rect.left, rect.top);
         bool over = hovered && g_hover.part == Part::Input;
@@ -2486,10 +2391,45 @@ Hit HitTest(POINT pt) {
     return {};
 }
 
-void SendCommand(const std::wstring& id, Action action, int index = 0) {
+void SendCommand(const Card& card, Action action, int index = 0) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_commands.push_back({id, action, index});
+    g_commands.push_back({card.info, action, index, action == Action::Button ? card.info.inputValue : L""});
     SetEvent(g_wakeEvent);
+}
+
+// The reply is typed on the card itself: the card window takes the keyboard while its reply box is focused, and the
+// text goes to the toast only with the button (see Command::reply). So typing is instant and needs no hidden window.
+Card* TypingCard() {
+    auto it = std::find_if(g_cards.begin(), g_cards.end(), [](const Card& c) { return c.info.inputFocused && !c.goneAt; });
+    return it == g_cards.end() ? nullptr : &*it;
+}
+
+void EndTyping() {
+    bool was = false;
+    for (auto& card : g_cards) {
+        was = was || card.info.inputFocused;
+        card.info.inputFocused = false;
+    }
+    if (was) {
+        ApplySnapshot();  // a card whose toast went meanwhile goes now
+        Redraw();
+    }
+}
+
+void StartTyping(HWND hwnd, Card& card) {
+    for (auto& other : g_cards) {
+        other.info.inputFocused = false;
+    }
+    card.info.inputFocused = true;
+    // Never activated by a click (WM_MOUSEACTIVATE): only now, for the keyboard. Clicking elsewhere ends it.
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+}
+
+void SendReply(Card& card, int button) {
+    SendCommand(card, Action::Button, button);
+    card.info.inputValue.clear();
+    EndTyping();
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2544,18 +2484,63 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             switch (hit.part) {
                 case Part::Body:
                 case Part::Close:
-                    SendCommand(card.info.id, hit.part == Part::Body ? Action::Open : Action::Dismiss);
+                    SendCommand(card, hit.part == Part::Body ? Action::Open : Action::Dismiss);
+                    card.info.inputFocused = false;
                     card.goneAt = NowMs();
                     break;
                 case Part::Button:
-                    // The card goes when the banner drops the toast (a "snooze" may keep it).
-                    SendCommand(card.info.id, Action::Button, hit.index);
+                    // The card goes when the toast is handled (a "snooze" on the banner may keep it).
+                    SendReply(card, hit.index);
                     break;
                 case Part::Input:
-                    SendCommand(card.info.id, Action::FocusInput);
+                    StartTyping(hwnd, card);
                     break;
                 case Part::None:
                     break;
+            }
+            Redraw();
+            return 0;
+        }
+        case WM_KILLFOCUS:
+            EndTyping();
+            return 0;
+        case WM_CHAR: {
+            Card* card = TypingCard();
+            if (!card) {
+                return 0;
+            }
+            std::wstring& text = card->info.inputValue;
+            wchar_t c = (wchar_t)wParam;
+            if (c == L'\r') {
+                if (!card->info.buttons.empty()) {
+                    SendReply(*card, 0);  // Enter sends with the first button, like the toast's reply box
+                }
+            } else if (c == 27) {
+                EndTyping();
+            } else if (c == L'\b') {
+                if (!text.empty()) {
+                    text.pop_back();
+                    if (!text.empty() && IS_HIGH_SURROGATE(text.back())) {
+                        text.pop_back();
+                    }
+                }
+            } else if (c == 0x7F) {  // Ctrl+Backspace: the last word
+                while (!text.empty() && iswspace(text.back())) text.pop_back();
+                while (!text.empty() && !iswspace(text.back())) text.pop_back();
+            } else if (c == 0x16) {  // Ctrl+V
+                if (OpenClipboard(hwnd)) {
+                    if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
+                        if (auto clip = (const wchar_t*)GlobalLock(data)) {
+                            for (const wchar_t* p = clip; *p; p++) {
+                                text += *p == L'\r' || *p == L'\n' || *p == L'\t' ? L' ' : *p;
+                            }
+                            GlobalUnlock(data);
+                        }
+                    }
+                    CloseClipboard();
+                }
+            } else if (c >= 0x20) {
+                text += c;
             }
             Redraw();
             return 0;
@@ -2679,6 +2664,7 @@ DWORD WINAPI UiThread(LPVOID) {
             }
             MSG msg;
             while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);  // keys to WM_CHAR for the reply typed on a card
                 DispatchMessage(&msg);
             }
             if (g_animating) {
