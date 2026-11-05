@@ -793,11 +793,29 @@ DWORD UserDword(const std::wstring& key, const wchar_t* name, DWORD missing) {
                : missing;
 }
 
+// Do not disturb (Focus assist): SHQueryUserNotificationState doesn't report it on Windows 11. The shell publishes the
+// active profile as the WNF state WNF_SHEL_QUIETHOURS_ACTIVE_PROFILE_CHANGED (0 off, 1 priority only, 2 alarms only),
+// read through ntdll's NtQueryWnfStateData (undocumented; if it's missing or fails, the check is skipped).
+bool QuietHours() {
+    using Query = LONG(NTAPI*)(const ULONGLONG*, const void*, const void*, ULONG*, void*, ULONG*);
+    static Query query = (Query)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryWnfStateData");
+    if (!query) {
+        return false;
+    }
+    const ULONGLONG name = 0x0D83063EA3BF1C75;
+    ULONG changeStamp = 0, profile = 0, size = sizeof(profile);
+    return query(&name, nullptr, nullptr, &changeStamp, &profile, &size) >= 0 && size == sizeof(profile) && profile;
+}
+
 // Whether Windows shows a banner for the app's toasts: notifications on, the app's banners on, no Do not disturb
-// or full-screen app. Otherwise the toast only goes to the notification center, and gets no card either.
+// or full-screen app. Otherwise the toast only goes to the notification center, and gets no card either. (With Do not
+// disturb, apps allowed through it still get cards: from their banner, which Windows does show.)
 bool BannerAllowed(const std::wstring& aumid) {
     QUERY_USER_NOTIFICATION_STATE state;
     if (SUCCEEDED(SHQueryUserNotificationState(&state)) && state != QUNS_ACCEPTS_NOTIFICATIONS && state != QUNS_APP) {
+        return false;
+    }
+    if (QuietHours()) {
         return false;
     }
     const std::wstring settings = L"Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings";
