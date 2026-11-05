@@ -2426,9 +2426,14 @@ void StartTyping(HWND hwnd, Card& card) {
     SetFocus(hwnd);
 }
 
+// A pressed button goes at once; the worker presses it on the banner or in the notification center meanwhile.
+// Skipped, so the toast doesn't get a card again while Windows still has it (e.g. after Snooze).
 void SendReply(Card& card, int button) {
     SendCommand(card, Action::Button, button);
     card.info.inputValue.clear();
+    card.info.inputFocused = false;
+    card.goneAt = NowMs();
+    g_skipped.push_back(card.info.id);
     EndTyping();
 }
 
@@ -2489,7 +2494,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     card.goneAt = NowMs();
                     break;
                 case Part::Button:
-                    // The card goes when the toast is handled (a "snooze" on the banner may keep it).
                     SendReply(card, hit.index);
                     break;
                 case Part::Input:
