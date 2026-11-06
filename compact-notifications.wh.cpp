@@ -920,6 +920,26 @@ std::vector<ToastInfo> NewStoredToasts(long long& lastArrival) {
     return result;
 }
 
+// Whether the stored toast (by its ArrivalTime) is still in the database: an app removes its toast once handled in
+// the app (an answered call). True only when the database was read and the row is gone.
+bool StoredToastGone(long long arrival) {
+    sqlite3* db = OpenNotificationDb();
+    if (!db) {
+        return false;
+    }
+    bool gone = false;
+    std::string sql = "SELECT COUNT(*) FROM Notification WHERE ArrivalTime = " + std::to_string(arrival);
+    sqlite3_stmt* stmt = nullptr;
+    if (g_sqlite.prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == 0) {
+        if (g_sqlite.step(stmt) == SQLITE_ROW) {
+            gone = atoll(Column(stmt, 0).c_str()) == 0;
+        }
+        g_sqlite.finalize(stmt);
+    }
+    g_sqlite.close(db);
+    return gone;
+}
+
 // Texts as compared between the database, the banner and the notification center: without the direction marks some
 // apps (Discord) put around names, and only the start of the message (the banner may cut or rewrap it).
 std::wstring Plain(const std::wstring& s) {
@@ -1519,6 +1539,12 @@ DWORD WINAPI WorkerThread(LPVOID) {
                 }
             }
             for (auto it = pending.begin(); it != pending.end();) {
+                // The app took its toast back (a call answered or declined in the app, a message read): no card.
+                if (it->info.id.rfind(L"stored#", 0) == 0 && StoredToastGone(wcstoll(it->info.id.c_str() + 7, nullptr, 10))) {
+                    Log(L"Stored toast removed by the app: %s / %s", it->info.title.c_str(), it->info.text.c_str());
+                    it = pending.erase(it);
+                    continue;
+                }
                 // Priority toasts (reminders, calls) wait for the banner, which keeps them until handled.
                 if (now < it->until || now < g_holdUntil || (it->info.priority && now < it->until + 10 * 60 * 1000)) {
                     ++it;
