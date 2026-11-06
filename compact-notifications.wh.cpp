@@ -29,6 +29,8 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
 * **Click** a card to do what clicking the original notification does (open the app or the conversation).
 * **×** (on hover) closes the card; the notification stays in the notification center.
 * **Buttons** from the notification (for example *Reply*, *Snooze*, *Dismiss*) are shown under the text.
+* **Codes**: a notification with a one-time code (e.g. an SMS from Phone Link) gets a *Copy 123456* button,
+  unless the app has its own copy button.
 * **Reply box**: click it and type, then press the app's send button (or Enter). The text goes into the
   original reply box together with the button press, so the app receives it as usual.
 * **Avatars**: the notification's image (local files and images from Store apps), or a thumbnail of its
@@ -151,6 +153,9 @@ banners back.
   - showActions: true
     $name: Show buttons and reply boxes
     $description: When off, cards only show the text; use the notification center to reply.
+  - copyCodes: true
+    $name: Copy button for codes
+    $description: A notification with a one-time code (for example an SMS from Phone Link) gets a button that copies the code, unless the app already has its own copy button.
   - highlightPriority: true
     $name: Highlight priority notifications
     $description: Colored outline for reminders, alarms and incoming calls.
@@ -1721,6 +1726,7 @@ struct Settings {
     bool top = false, left = false;  // corner
     bool showActions = true;
     bool highlightPriority = true;
+    bool copyCodes = true;
     UINT32 priorityColor = 0xF0A020;  // reminders, alarms, calls
     std::vector<AppRule> rules;
 } g_settings;
@@ -1767,6 +1773,7 @@ void LoadSettings() {
     s.left = corner.find(L"Left") != std::wstring::npos;
     s.showActions = Wh_GetIntSetting(L"behavior.showActions") != 0;
     s.highlightPriority = Wh_GetIntSetting(L"behavior.highlightPriority") != 0;
+    s.copyCodes = Wh_GetIntSetting(L"behavior.copyCodes") != 0;
     if (UINT32 color = ColorSetting(L"behavior.priorityColor"); color != kNoColor) {
         s.priorityColor = color;
     }
@@ -1876,6 +1883,8 @@ struct Card {
     ULONGLONG shownAt = 0;
     ULONGLONG goneAt = 0;  // 0 while the system banner still has the toast
     float top = 0;         // last drawn position, for hit testing
+    std::wstring code;     // one-time code found in the text, copied by the mod's own last button
+    int copyButton = -1;   // its index in info.buttons (after the app's buttons), -1 if none
 };
 
 std::vector<Card> g_cards;
@@ -2075,6 +2084,90 @@ D2D1_RECT_F ButtonRect(const Card& card, int index) {
     return {left, top, left + width, top + kFieldHeight};
 }
 
+// A one-time code in a notification: 4-8 digits (groups like "123 456" or "123-456" are joined), only when the
+// texts mention a code, so phone numbers, amounts and dates in ordinary messages don't count. The digits nearest
+// after the keyword win.
+std::wstring FindCode(const std::wstring& title, const std::wstring& body) {
+    std::wstring all = title + L"\n" + body;
+    std::wstring lower = all;
+    for (auto& c : lower) {
+        c = towlower(c);
+    }
+    static const wchar_t* keywords[] = {L"code", L"kod", L"otp", L"pin", L"passcode", L"password", L"hasło",
+                                        L"haslo", L"verif", L"weryfik", L"blik", L"2fa", L"token", L"código"};
+    size_t keyword = std::wstring::npos;
+    for (auto k : keywords) {
+        keyword = std::min(keyword, lower.find(k));
+    }
+    if (keyword == std::wstring::npos) {
+        return L"";
+    }
+    auto digit = [&](size_t i) { return i < all.size() && all[i] >= L'0' && all[i] <= L'9'; };
+    auto word = [&](size_t i) { return i < all.size() && (iswalnum(all[i]) || all[i] == L'%'); };
+    std::vector<std::pair<size_t, std::wstring>> found;
+    size_t i = 0;
+    while (i < all.size()) {
+        // A number starts after a non-word character that isn't part of another number (+48, 12.50, 1,5).
+        bool starts = digit(i) && (i == 0 || !(word(i - 1) || all[i - 1] == L'+' ||
+                                               ((all[i - 1] == L'.' || all[i - 1] == L',') && digit(i - 2))));
+        if (!starts) {
+            i++;
+            continue;
+        }
+        size_t start = i;
+        std::wstring digits;
+        while (true) {
+            size_t group = i;
+            while (digit(i)) {
+                digits += all[i++];
+            }
+            // Groups of three are joined: "123 456", "123-456".
+            if (i - group == 3 && (all[i] == L' ' || all[i] == L'-') && digit(i + 1) && digit(i + 3) && !digit(i + 4)) {
+                i++;
+                continue;
+            }
+            break;
+        }
+        // Ends at a non-word character, not in the middle of 12.50, 10:30 or 25%.
+        bool ends = !word(i) && !((all[i] == L'.' || all[i] == L',' || all[i] == L':') && digit(i + 1));
+        if (ends && digits.size() >= 4 && digits.size() <= 8) {
+            found.push_back({start, digits});
+        }
+    }
+    for (auto& [at, digits] : found) {
+        if (at > keyword) return digits;
+    }
+    return found.size() == 1 ? found[0].second : L"";
+}
+
+// The app's own copy button (Phone Link has one for codes): then the mod adds none.
+bool HasCopyButton(const std::vector<std::wstring>& buttons, const std::wstring& code) {
+    for (auto name : buttons) {
+        for (auto& c : name) c = towlower(c);
+        std::wstring digits;
+        for (auto c : name) if (iswdigit(c)) digits += c;
+        if (name.find(L"cop") != std::wstring::npos || name.find(L"kopi") != std::wstring::npos ||
+            (!code.empty() && digits.find(code) != std::wstring::npos)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CopyText(HWND hwnd, const std::wstring& text) {
+    if (!OpenClipboard(hwnd)) return false;
+    EmptyClipboard();
+    bool ok = false;
+    if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t))) {
+        memcpy(GlobalLock(memory), text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(memory);
+        ok = SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+        if (!ok) GlobalFree(memory);
+    }
+    CloseClipboard();
+    return ok;
+}
+
 void ApplySnapshot() {
     std::vector<ToastInfo> snapshot;
     {
@@ -2121,6 +2214,15 @@ void ApplySnapshot() {
         }
         if (!g_settings.showActions || !rule.replyBox) {
             card.info.hasInput = false;
+        }
+        if (g_settings.showActions && rule.buttons && g_settings.copyCodes) {
+            std::wstring code = FindCode(info.title, info.text);
+            if (!code.empty() && !HasCopyButton(card.info.buttons, code)) {
+                card.code = code;
+                card.copyButton = (int)card.info.buttons.size();
+                card.info.buttons.push_back(L"Copy " + code);
+                Log(L"Code %s: copy button", code.c_str());
+            }
         }
         card.showAvatar = g_settings.showAvatars && rule.avatar;
         card.info.priority = card.info.priority && g_settings.highlightPriority;
@@ -2461,6 +2563,14 @@ void StartTyping(HWND hwnd, Card& card) {
 // A pressed button goes at once; the worker presses it on the banner or in the notification center meanwhile.
 // Skipped, so the toast doesn't get a card again while Windows still has it (e.g. after Snooze).
 void SendReply(Card& card, int button) {
+    if (button == card.copyButton) {
+        // The mod's own button: the code goes to the clipboard and the card closes, the toast stays in the center.
+        CopyText(g_window, card.code);
+        card.info.inputFocused = false;
+        card.goneAt = NowMs();
+        EndTyping();
+        return;
+    }
     SendCommand(card, Action::Button, button);
     card.info.inputValue.clear();
     card.info.inputFocused = false;
@@ -2550,7 +2660,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             std::wstring& text = card->info.inputValue;
             wchar_t c = (wchar_t)wParam;
             if (c == L'\r') {
-                if (!card->info.buttons.empty()) {
+                if (!card->info.buttons.empty() && card->copyButton != 0) {
                     SendReply(*card, 0);  // Enter sends with the first button, like the toast's reply box
                 }
             } else if (c == 27) {
