@@ -955,6 +955,10 @@ HANDLE g_wakeEvent = nullptr;  // set when the banner window shows or moves, or 
 HANDLE g_workerThread = nullptr;
 HANDLE g_uiThread = nullptr;
 std::atomic<HWND> g_window{nullptr};  // created by the card thread, posted to by the worker
+// Cards don't run out under the mouse (the banner's own timer doesn't see the mouse on a card): until this tick
+// (GetTickCount64), set by the card thread, the worker keeps every card. Max while hovering, a short grace after.
+std::atomic<ULONGLONG> g_holdUntil{0};
+constexpr ULONGLONG kHoverGraceMs = 2000;
 std::atomic<DWORD> g_shellPid{0};  // ShellExperienceHost, whose window events wake the worker
 HWINEVENTHOOK g_eventHook = nullptr;  // owned by the card thread
 
@@ -1511,7 +1515,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
             }
             for (auto it = pending.begin(); it != pending.end();) {
                 // Priority toasts (reminders, calls) wait for the banner, which keeps them until handled.
-                if (now < it->until || (it->info.priority && now < it->until + 10 * 60 * 1000)) {
+                if (now < it->until || now < g_holdUntil || (it->info.priority && now < it->until + 10 * 60 * 1000)) {
                     ++it;
                     continue;
                 }
@@ -1620,7 +1624,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
                         }
                         // Its card ends on time unless it waits to be handled (the card keeps itself while the user
                         // types in it).
-                        if (until && GetTickCount64() > until && !info.priority) {
+                        if (until && GetTickCount64() > until && GetTickCount64() >= g_holdUntil && !info.priority) {
                             hidden = true;
                         }
                         current.push_back({info, runtimeId, element, hidden, until});
@@ -1632,7 +1636,9 @@ DWORD WINAPI WorkerThread(LPVOID) {
                 // mod's own Win+N too): the card stays, now acting through the center.
                 bool kept = std::any_of(current.begin(), current.end(),
                                         [&](const Known& c) { return c.info.id == k.info.id; });
-                if (!kept && k.until && !k.hidden && GetTickCount64() < k.until) {
+                // Also when its time ran out under the mouse: the card waits for the mouse to leave.
+                ULONGLONG tick = GetTickCount64();
+                if (!kept && !k.hidden && ((k.until && tick < k.until) || (tick < g_holdUntil && !k.info.priority))) {
                     pending.push_back({k.info, k.until});
                 }
                 k.element->Release();
@@ -2494,6 +2500,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return MA_NOACTIVATE;
         case WM_MOUSEMOVE: {
             Hit hit = HitTest(POINT{(short)LOWORD(lParam), (short)HIWORD(lParam)});
+            g_holdUntil = hit.card >= 0 ? ULLONG_MAX : GetTickCount64() + kHoverGraceMs;
             if (!(hit == g_hover)) {
                 g_hover = hit;
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
@@ -2503,6 +2510,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case WM_MOUSELEAVE:
+            g_holdUntil = GetTickCount64() + kHoverGraceMs;
             g_hover = {};
             Redraw();
             return 0;
