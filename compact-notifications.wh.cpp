@@ -2094,7 +2094,8 @@ std::wstring FindCode(const std::wstring& title, const std::wstring& body) {
         c = towlower(c);
     }
     static const wchar_t* keywords[] = {L"code", L"kod", L"otp", L"pin", L"passcode", L"password", L"hasło",
-                                        L"haslo", L"verif", L"weryfik", L"blik", L"2fa", L"token", L"código"};
+                                        L"haslo", L"verif", L"weryfik", L"blik", L"2fa", L"token", L"código", L"sign in", L"sign-in",
+                                        L"log in", L"login", L"security", L"logowa", L"zaloguj"};
     size_t keyword = std::wstring::npos;
     for (auto k : keywords) {
         keyword = std::min(keyword, lower.find(k));
