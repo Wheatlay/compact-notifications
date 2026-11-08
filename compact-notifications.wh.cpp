@@ -30,20 +30,23 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
 * **×** (on hover) closes the card; the notification stays in the notification center.
 * **Buttons** from the notification (for example *Reply*, *Snooze*, *Dismiss*) are shown under the text.
 * **Codes**: a notification with a one-time code (e.g. an SMS from Phone Link) gets a *Copy 123456* button,
-  unless the app has its own copy button.
+  unless the app has its own copy button. Its label is in Polish when Windows is, in English otherwise.
 * **Reply box**: click it and type, then press the app's send button (or Enter). The text goes into the
   original reply box together with the button press, so the app receives it as usual.
 * **Avatars**: the notification's image (local files and images from Store apps), or a thumbnail of its
   large picture (e.g. a screenshot); otherwise the app's registered icon (e.g. Firefox), and the first
   letter of the app as the last resort. Web images aren't downloaded.
-* **Priority notifications** (reminders, alarms, incoming calls) get a colored outline and stay until handled.
+* **Priority notifications** (reminders, alarms, incoming calls) get a colored outline and stay until handled;
+  the card limit never pushes them out.
+* **Chat formatting**: \*\*bold\*\*, \*italic\*, \_\_underline\_\_, \~\~strike\~\~ and \`code\` left in the text by
+  chat apps are shown formatted (can be turned off).
 
 ## Settings
 
 * **Appearance**: theme, size, lines of text, card width, corner radius, background opacity, your own card
   and text colors, distance from the screen edge.
 * **Avatars**: on or off, circle, rounded square or square, the app's name before the sender.
-* **Animation**: on or off, speed, how many cards show at once.
+* **Animation**: on or off, playful or plain, speed, how many cards show at once.
 * **Position**: monitor and corner.
 * **Per-app rules**: for a single app (by the name shown on its notifications), hide the buttons, the reply
   box or the avatar, or don't show cards for it at all; its notifications still go to the notification center.
@@ -128,6 +131,9 @@ banners back.
   - enabled: true
     $name: Animate cards
     $description: Slide in and fade out. When off, cards appear and disappear at once.
+  - playful: true
+    $name: Playful animations
+    $description: Cards pop out of the corner like a bubble and shrink away, the other cards glide to their new place, pressed buttons bounce. When off, or when Windows animation effects are off, cards just slide in and fade out.
   - speed: 100
     $name: Animation speed (%)
     $description: 200 is twice as fast, 50 half as fast. From 25 to 400.
@@ -156,6 +162,9 @@ banners back.
   - copyCodes: true
     $name: Copy button for codes
     $description: A notification with a one-time code (for example an SMS from Phone Link) gets a button that copies the code, unless the app already has its own copy button.
+  - markdown: true
+    $name: Format chat text
+    $description: Shows **bold**, *italic*, __underline__, ~~strike~~ and `code` as chat apps (Discord, Slack, Teams) mean them, instead of the raw marks. Turn off if an app's text loses characters (e.g. file names like __init__.py).
   - highlightPriority: true
     $name: Highlight priority notifications
     $description: Colored outline for reminders, alarms and incoming calls.
@@ -197,7 +206,6 @@ banners back.
 #include <windhawk_utils.h>
 
 #include <climits>
-#include <format>
 #include <wchar.h>
 
 #include <algorithm>
@@ -441,6 +449,7 @@ void RestoreBanner() {
 struct ToastInfo {
     // App, title and text (plus a counter for identical toasts). UIA runtime ids change while the banner lives.
     std::wstring id;
+    long long arrival = 0;  // a stored toast's ArrivalTime (its row in the database), 0 for one read from the banner
     std::wstring app;
     std::wstring title;
     std::wstring text;
@@ -472,6 +481,7 @@ struct Sqlite {
 
 constexpr int SQLITE_OPEN_READONLY = 0x1;
 constexpr int SQLITE_ROW = 100;
+constexpr int SQLITE_DONE = 101;
 
 bool LoadSqlite() {
     if (g_sqlite.loaded) {
@@ -658,38 +668,56 @@ std::wstring NotificationFolder() {
     return std::wstring(localAppData) + L"\\Microsoft\\Windows\\Notifications";
 }
 
+// One read-only connection, opened when first needed and kept by the worker thread (the only one that reads the
+// database) until it ends: the worker reads every pass while cards are up. Closed and opened again after an error.
+sqlite3* g_db = nullptr;
+
 sqlite3* OpenNotificationDb() {
+    if (g_db) {
+        return g_db;
+    }
     std::wstring folder = NotificationFolder();
     if (folder.empty() || !LoadSqlite()) {
         return nullptr;
     }
     std::string path = ToUtf8(folder + L"\\wpndatabase.db");
-    sqlite3* db = nullptr;
-    if (g_sqlite.open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != 0) {
+    if (g_sqlite.open_v2(path.c_str(), &g_db, SQLITE_OPEN_READONLY, nullptr) != 0) {
         Log(L"Opening the notification database failed");
-        if (db) {
-            g_sqlite.close(db);
+        if (g_db) {
+            g_sqlite.close(g_db);
+            g_db = nullptr;
         }
-        return nullptr;
     }
-    return db;
+    return g_db;
+}
+
+void CloseNotificationDb() {
+    if (g_db) {
+        g_sqlite.close(g_db);
+        g_db = nullptr;
+    }
+}
+
+// Runs a query on the shared connection; on a failed prepare the connection is dropped, so the next read reopens it.
+sqlite3_stmt* Prepare(const std::string& sql) {
+    sqlite3* db = OpenNotificationDb();
+    sqlite3_stmt* stmt = nullptr;
+    if (db && g_sqlite.prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != 0) {
+        stmt = nullptr;
+        CloseNotificationDb();
+    }
+    return stmt;
 }
 
 // Finds the newest stored toast whose text contains both the title and the message, and returns its avatar.
 std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
-    sqlite3* db = OpenNotificationDb();
-    if (!db) {
-        return {};
-    }
     // Only the start of the message: the banner can show it with other line breaks or cut off (Firefox, Gmail).
     std::wstring start = text.substr(0, std::min(text.find_first_of(L"\r\n"), (size_t)24));
     std::string wantTitle = ToUtf8(title), wantText = ToUtf8(start);
     std::string payload, aumid;
-    sqlite3_stmt* stmt = nullptr;
-    if (g_sqlite.prepare_v2(db,
-                            "SELECT n.Payload, h.PrimaryId FROM Notification n JOIN NotificationHandler h "
-                            "ON h.RecordId = n.HandlerId WHERE n.Type = 'toast' ORDER BY n.ArrivalTime DESC LIMIT 30",
-                            -1, &stmt, nullptr) == 0) {
+    if (sqlite3_stmt* stmt =
+            Prepare("SELECT n.Payload, h.PrimaryId FROM Notification n JOIN NotificationHandler h "
+                    "ON h.RecordId = n.HandlerId WHERE n.Type = 'toast' ORDER BY n.ArrivalTime DESC LIMIT 30")) {
         while (g_sqlite.step(stmt) == SQLITE_ROW) {
             auto data = (const char*)g_sqlite.column_blob(stmt, 0);
             int size = g_sqlite.column_bytes(stmt, 0);
@@ -708,7 +736,6 @@ std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
         }
         g_sqlite.finalize(stmt);
     }
-    g_sqlite.close(db);
     return payload.empty() ? std::wstring() : AvatarFromPayload(payload, FromUtf8(aumid));
 }
 
@@ -885,18 +912,15 @@ std::string Column(sqlite3_stmt* stmt, int index) {
 // The first call (lastArrival -1) only finds the newest one: older toasts came before the mod.
 std::vector<ToastInfo> NewStoredToasts(long long& lastArrival) {
     std::vector<ToastInfo> result;
-    sqlite3* db = OpenNotificationDb();
-    if (!db) {
-        return result;
-    }
     bool first = lastArrival < 0;
+    bool read = false;  // a row came back: only then the first call sets where reading starts
     std::string sql = first ? "SELECT MAX(ArrivalTime) FROM Notification"
                             : "SELECT n.ArrivalTime, n.Payload, h.PrimaryId FROM Notification n JOIN NotificationHandler h "
                               "ON h.RecordId = n.HandlerId WHERE n.Type = 'toast' AND n.ArrivalTime > " +
                                   std::to_string(lastArrival) + " ORDER BY n.ArrivalTime";
-    sqlite3_stmt* stmt = nullptr;
-    if (g_sqlite.prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == 0) {
+    if (sqlite3_stmt* stmt = Prepare(sql)) {
         while (g_sqlite.step(stmt) == SQLITE_ROW) {
+            read = true;
             long long arrival = atoll(Column(stmt, 0).c_str());
             lastArrival = std::max(lastArrival, arrival);
             if (first) {
@@ -911,33 +935,41 @@ std::vector<ToastInfo> NewStoredToasts(long long& lastArrival) {
                 continue;
             }
             info.id = L"stored#" + std::to_wstring(arrival);
+            info.arrival = arrival;
             result.push_back(info);
         }
         g_sqlite.finalize(stmt);
     }
-    g_sqlite.close(db);
-    lastArrival = std::max(lastArrival, 0LL);
+    // A failed first read (database busy or missing) tries again next time; starting from 0 would make a card of
+    // every toast in the database.
+    if (!first || read) {
+        lastArrival = std::max(lastArrival, 0LL);
+    }
     return result;
 }
 
-// Whether the stored toast (by its ArrivalTime) is still in the database: an app removes its toast once handled in
-// the app (an answered call). True only when the database was read and the row is gone.
-bool StoredToastGone(long long arrival) {
-    sqlite3* db = OpenNotificationDb();
-    if (!db) {
-        return false;
+// Which of the stored toasts (by ArrivalTime) the apps took back: an app removes its toast once handled in the app
+// (an answered call). One query for all of them; nothing counts as gone when the database can't be read.
+std::vector<long long> StoredToastsGone(const std::vector<long long>& arrivals) {
+    if (arrivals.empty()) {
+        return {};
     }
-    bool gone = false;
-    std::string sql = "SELECT COUNT(*) FROM Notification WHERE ArrivalTime = " + std::to_string(arrival);
-    sqlite3_stmt* stmt = nullptr;
-    if (g_sqlite.prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == 0) {
-        if (g_sqlite.step(stmt) == SQLITE_ROW) {
-            gone = atoll(Column(stmt, 0).c_str()) == 0;
-        }
-        g_sqlite.finalize(stmt);
+    std::string sql = "SELECT ArrivalTime FROM Notification WHERE ArrivalTime IN (";
+    for (size_t i = 0; i < arrivals.size(); i++) {
+        sql += (i ? "," : "") + std::to_string(arrivals[i]);
     }
-    g_sqlite.close(db);
-    return gone;
+    sql += ")";
+    sqlite3_stmt* stmt = Prepare(sql);
+    if (!stmt) {
+        return {};
+    }
+    std::vector<long long> gone = arrivals;
+    int rc;
+    while ((rc = g_sqlite.step(stmt)) == SQLITE_ROW) {
+        std::erase(gone, atoll(Column(stmt, 0).c_str()));
+    }
+    g_sqlite.finalize(stmt);
+    return rc == SQLITE_DONE ? gone : std::vector<long long>();  // a read cut short (busy) proves nothing
 }
 
 // Texts as compared between the database, the banner and the notification center: without the direction marks some
@@ -977,6 +1009,7 @@ std::vector<Command> g_commands;    // guarded by g_mutex
 
 HANDLE g_stopEvent = nullptr;
 HANDLE g_wakeEvent = nullptr;  // set when the banner window shows or moves, or a card is clicked
+HANDLE g_workerReady = nullptr;  // set once the worker can read toasts (UI Automation works)
 HANDLE g_workerThread = nullptr;
 HANDLE g_uiThread = nullptr;
 std::atomic<HWND> g_window{nullptr};  // created by the card thread, posted to by the worker
@@ -1259,6 +1292,8 @@ DWORD WINAPI WorkerThread(LPVOID) {
                 uia2->put_TransactionTimeout(1000);
             }
         }
+        // Only now the card window may come (and with it the banner hiding): without a reader, banners stay.
+        SetEvent(g_workerReady);
         auto classCondition = [&](const wchar_t* className, Com<IUIAutomationCondition>& condition) {
             VARIANT v{};
             v.vt = VT_BSTR;
@@ -1538,9 +1573,16 @@ DWORD WINAPI WorkerThread(LPVOID) {
                     pending.push_back({info, now + cardMs()});
                 }
             }
+            std::vector<long long> arrivals;
+            for (auto& p : pending) {
+                if (p.info.arrival) {
+                    arrivals.push_back(p.info.arrival);
+                }
+            }
+            std::vector<long long> taken = StoredToastsGone(arrivals);
             for (auto it = pending.begin(); it != pending.end();) {
                 // The app took its toast back (a call answered or declined in the app, a message read): no card.
-                if (it->info.id.rfind(L"stored#", 0) == 0 && StoredToastGone(wcstoll(it->info.id.c_str() + 7, nullptr, 10))) {
+                if (it->info.arrival && std::find(taken.begin(), taken.end(), it->info.arrival) != taken.end()) {
                     Log(L"Stored toast removed by the app: %s / %s", it->info.title.c_str(), it->info.text.c_str());
                     it = pending.erase(it);
                     continue;
@@ -1610,11 +1652,13 @@ DWORD WINAPI WorkerThread(LPVOID) {
                             });
                             if (waiting != pending.end()) {
                                 info.id = waiting->info.id;
+                                info.arrival = waiting->info.arrival;
                                 image = waiting->info.image;
                                 until = waiting->until;
                                 pending.erase(waiting);
                             } else if (gone != expired.end()) {
                                 info.id = gone->first.id;
+                                info.arrival = gone->first.arrival;
                                 hidden = true;
                                 expired.erase(gone);
                             }
@@ -1708,6 +1752,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
         if (dbChange != INVALID_HANDLE_VALUE) {
             FindCloseChangeNotification(dbChange);
         }
+        CloseNotificationDb();
     }
     CoUninitialize();
     return 0;
@@ -1722,6 +1767,8 @@ constexpr float kCardPadX = 12, kCardPadY = 10, kAvatar = 40, kGap = 10;
 constexpr float kFontSize = 13, kLine = kFontSize * 1.35f;
 constexpr float kFieldHeight = 28, kRowGap = 8, kFieldRadius = 7, kButtonGap = 6;
 constexpr DWORD kInMs = 280, kOutMs = 400;
+// Playful style: pop in from the corner, shrink away, glide to a new place, bounce a pressed button.
+constexpr DWORD kPopInMs = 380, kPopOutMs = 260, kShiftMs = 420, kPressMs = 380;
 
 // Mod settings (WindhawkModSettings). Sizes are in CSS pixels; "size" scales all of them.
 enum class ThemeChoice { Auto, Dark, Light };
@@ -1747,12 +1794,15 @@ struct Settings {
     AvatarShape avatarShape = AvatarShape::Circle;
     bool appName = false;
     DWORD inMs = kInMs, outMs = kOutMs;  // 0 without animation
+    bool playful = true;                 // never with animation off
+    DWORD popInMs = kPopInMs, popOutMs = kPopOutMs, shiftMs = kShiftMs, pressMs = kPressMs;
     int maxCards = 5;
     bool cursorMonitor = true;
     bool top = false, left = false;  // corner
     bool showActions = true;
     bool highlightPriority = true;
     bool copyCodes = true;
+    bool markdown = true;
     UINT32 priorityColor = 0xF0A020;  // reminders, alarms, calls
     std::vector<AppRule> rules;
 } g_settings;
@@ -1800,6 +1850,7 @@ void LoadSettings() {
     s.showActions = Wh_GetIntSetting(L"behavior.showActions") != 0;
     s.highlightPriority = Wh_GetIntSetting(L"behavior.highlightPriority") != 0;
     s.copyCodes = Wh_GetIntSetting(L"behavior.copyCodes") != 0;
+    s.markdown = Wh_GetIntSetting(L"behavior.markdown") != 0;
     if (UINT32 color = ColorSetting(L"behavior.priorityColor"); color != kNoColor) {
         s.priorityColor = color;
     }
@@ -1822,24 +1873,33 @@ void LoadSettings() {
     s.appName = Wh_GetIntSetting(L"avatars.appName") != 0;
     if (!Wh_GetIntSetting(L"animation.enabled")) {
         s.inMs = s.outMs = 0;
-    } else if (int speed = Wh_GetIntSetting(L"animation.speed")) {
-        speed = std::clamp(speed, 25, 400);
-        s.inMs = kInMs * 100 / speed;
-        s.outMs = kOutMs * 100 / speed;
+        s.playful = false;
+    } else {
+        s.playful = Wh_GetIntSetting(L"animation.playful") != 0;
+        if (int speed = Wh_GetIntSetting(L"animation.speed")) {
+            speed = std::clamp(speed, 25, 400);
+            s.inMs = kInMs * 100 / speed;
+            s.outMs = kOutMs * 100 / speed;
+            s.popInMs = kPopInMs * 100 / speed;
+            s.popOutMs = kPopOutMs * 100 / speed;
+            s.shiftMs = kShiftMs * 100 / speed;
+            s.pressMs = kPressMs * 100 / speed;
+        }
     }
     if (int maxCards = Wh_GetIntSetting(L"animation.maxCards")) {
         s.maxCards = std::clamp(maxCards, 1, 10);
     }
     for (int i = 0; i < 100; i++) {
         AppRule rule;
-        rule.app = StringSetting(std::format(L"appRules[{}].app", i).c_str());
+        rule.app = WindhawkUtils::StringSetting(Wh_GetStringSetting(L"appRules[%d].app", i)).get();
         if (rule.app.empty()) {
             break;
         }
-        rule.mute = StringSetting(std::format(L"appRules[{}].show", i).c_str()) == L"mute";
-        rule.buttons = Wh_GetIntSetting(std::format(L"appRules[{}].buttons", i).c_str()) != 0;
-        rule.replyBox = Wh_GetIntSetting(std::format(L"appRules[{}].replyBox", i).c_str()) != 0;
-        rule.avatar = Wh_GetIntSetting(std::format(L"appRules[{}].avatar", i).c_str()) != 0;
+        rule.mute = std::wstring(WindhawkUtils::StringSetting(Wh_GetStringSetting(L"appRules[%d].show", i)).get()) ==
+                    L"mute";
+        rule.buttons = Wh_GetIntSetting(L"appRules[%d].buttons", i) != 0;
+        rule.replyBox = Wh_GetIntSetting(L"appRules[%d].replyBox", i) != 0;
+        rule.avatar = Wh_GetIntSetting(L"appRules[%d].avatar", i) != 0;
         s.rules.push_back(rule);
     }
     g_settings = s;
@@ -1889,6 +1949,12 @@ bool SystemUsesLightTheme() {
            value != 0;
 }
 
+Theme CurrentTheme() {
+    bool light = g_settings.theme == ThemeChoice::Light ||
+                 (g_settings.theme == ThemeChoice::Auto && SystemUsesLightTheme());
+    return CustomTheme(light ? kLight : kDark);
+}
+
 enum class Part { None, Body, Close, Button, Input };
 
 struct Hit {
@@ -1904,6 +1970,7 @@ struct Card {
     IDWriteTextLayout* text = nullptr;
     ID2D1Bitmap* avatar = nullptr;
     bool showAvatar = true;   // the avatars setting and the app's rule
+    bool waitsForUser = false;  // a reminder, alarm or call (with or without the highlight setting)
     float contentHeight = 0;  // avatar and texts, without buttons and the reply box
     float height = 0;
     ULONGLONG shownAt = 0;
@@ -1911,7 +1978,15 @@ struct Card {
     float top = 0;         // last drawn position, for hit testing
     std::wstring code;     // one-time code found in the text, copied by the mod's own last button
     int copyButton = -1;   // its index in info.buttons (after the app's buttons), -1 if none
+    ULONGLONG copiedAt = 0;  // the copy button was pressed: it reads "Copied" for a moment, then the card goes
+    // Playful style: distance of the card's top from the corner's edge (glides between edgeFrom and edgeTo).
+    float edgeFrom = -1, edgeTo = -1;
+    ULONGLONG shiftAt = 0;
+    int pressedButton = -1;  // bounces for a moment after a press
+    ULONGLONG pressedAt = 0;
 };
+
+constexpr ULONGLONG kCopiedMs = 900;
 
 std::vector<Card> g_cards;
 std::vector<std::wstring> g_skipped;  // ids of toasts shown without a card (see ApplySnapshot)
@@ -1971,6 +2046,48 @@ float EaseOut(float t) {
     return 1 - (1 - t) * (1 - t) * (1 - t);
 }
 
+// Ease-out that overshoots a little before settling.
+float EaseOutBack(float t) {
+    t = std::clamp(t, 0.0f, 1.0f) - 1;
+    const float c = 1.2f;
+    return 1 + (c + 1) * t * t * t + c * t * t;
+}
+
+// A value through keyframes {time 0..1, value}, smoothed within each segment.
+float Keyframes(float t, std::initializer_list<std::pair<float, float>> keys) {
+    auto prev = *keys.begin();
+    for (auto key : keys) {
+        if (t <= key.first) {
+            if (key.first <= prev.first) {
+                return key.second;
+            }
+            float u = (t - prev.first) / (key.first - prev.first);
+            u = u * u * (3 - 2 * u);
+            return prev.second + (key.second - prev.second) * u;
+        }
+        prev = key;
+    }
+    return prev.second;
+}
+
+// Playful animations: the setting, unless Windows animation effects are off (checked at most once a second).
+bool Playful() {
+    static ULONGLONG checkedAt = 0;
+    static BOOL systemOn = TRUE;
+    ULONGLONG now = NowMs();
+    if (!checkedAt || now - checkedAt > 1000) {
+        checkedAt = now;
+        if (!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &systemOn, 0)) {
+            systemOn = TRUE;
+        }
+    }
+    return g_settings.playful && systemOn;
+}
+
+DWORD OutMs() {
+    return Playful() ? g_settings.popOutMs : g_settings.outMs;
+}
+
 void ReleaseCard(Card& card) {
     for (IUnknown* object : std::initializer_list<IUnknown*>{card.title, card.text, card.avatar}) {
         if (object) {
@@ -1987,18 +2104,34 @@ ID2D1Bitmap* LoadBitmap(const std::wstring& path) {
     ID2D1Bitmap* bitmap = nullptr;
     IWICBitmapDecoder* decoder = nullptr;
     IWICBitmapFrameDecode* frame = nullptr;
+    IWICBitmapScaler* scaler = nullptr;
     IWICFormatConverter* converter = nullptr;
     if (SUCCEEDED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad,
                                                    &decoder)) &&
-        SUCCEEDED(decoder->GetFrame(0, &frame)) && SUCCEEDED(g_wic->CreateFormatConverter(&converter)) &&
-        SUCCEEDED(converter->Initialize(frame, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
-                                        WICBitmapPaletteTypeMedianCut))) {
-        g_target->CreateBitmapFromWicBitmap(converter, nullptr, &bitmap);
+        SUCCEEDED(decoder->GetFrame(0, &frame))) {
+        // Only the avatar's size is kept (a screenshot would take tens of MB for a 40 px circle): the shorter side
+        // is scaled down to the avatar's size in screen pixels, as the image fills the avatar (cover).
+        IWICBitmapSource* source = frame;
+        UINT width = 0, height = 0;
+        UINT side = (UINT)(kAvatar * Scale() + 1);
+        if (SUCCEEDED(frame->GetSize(&width, &height)) && width && height && std::min(width, height) > side &&
+            SUCCEEDED(g_wic->CreateBitmapScaler(&scaler))) {
+            double fit = (double)side / std::min(width, height);
+            UINT w = std::max(1u, (UINT)(width * fit + 0.5)), h = std::max(1u, (UINT)(height * fit + 0.5));
+            if (SUCCEEDED(scaler->Initialize(frame, w, h, WICBitmapInterpolationModeFant))) {
+                source = scaler;
+            }
+        }
+        if (SUCCEEDED(g_wic->CreateFormatConverter(&converter)) &&
+            SUCCEEDED(converter->Initialize(source, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+                                            WICBitmapPaletteTypeMedianCut))) {
+            g_target->CreateBitmapFromWicBitmap(converter, nullptr, &bitmap);
+        }
     }
     if (!bitmap) {
         Log(L"Loading the avatar failed: %s", path.c_str());
     }
-    for (IUnknown* object : std::initializer_list<IUnknown*>{converter, frame, decoder}) {
+    for (IUnknown* object : std::initializer_list<IUnknown*>{converter, scaler, frame, decoder}) {
         if (object) {
             object->Release();
         }
@@ -2011,16 +2144,17 @@ float AvatarSpace(const Card& card) {
     return card.showAvatar ? kAvatar + kGap : 0;
 }
 
-// Simple Markdown as chat apps (Slack, Discord, Teams) leave it in toasts: **bold**, __bold__, *italic*,
-// ~~strike~~, `code`. Marks are removed; each pair becomes a styled range. An unpaired mark stays as text.
+// Simple Markdown as chat apps (Slack, Discord, Teams) leave it in toasts: **bold**, __underline__ (as Discord
+// shows it), *italic*, ~~strike~~, `code`. Marks are removed; each pair becomes a styled range. An unpaired mark stays
+// as text. The "Format chat text" setting turns it off.
 struct MarkRange {
     UINT32 start, length;
-    int style;  // 0 bold, 1 italic, 2 strike, 3 code
+    int style;  // 0 bold, 1 italic, 2 strike, 3 code, 4 underline
 };
 
 std::wstring StripMarkdown(const std::wstring& in, std::vector<MarkRange>& ranges) {
     static const struct { const wchar_t* mark; int style; } kMarks[] = {
-        {L"**", 0}, {L"__", 0}, {L"~~", 2}, {L"`", 3}, {L"*", 1}};
+        {L"**", 0}, {L"__", 4}, {L"~~", 2}, {L"`", 3}, {L"*", 1}};
     std::wstring out;
     size_t i = 0;
     while (i < in.size()) {
@@ -2060,7 +2194,7 @@ void LayoutCard(Card& card) {
     }
     g_dwrite->CreateTextLayout(title.c_str(), (UINT32)title.size(), g_titleFormat, textWidth, kLine, &card.title);
     std::vector<MarkRange> ranges;
-    std::wstring text = StripMarkdown(card.info.text, ranges);
+    std::wstring text = g_settings.markdown ? StripMarkdown(card.info.text, ranges) : card.info.text;
     // Keep one-letter words and numbers with the next word ("za 1 h", "w domu"): a no-break space after them.
     for (size_t i = 1; i < text.size(); i++) {
         if (text[i] != L' ') continue;
@@ -2078,6 +2212,7 @@ void LayoutCard(Card& card) {
             if (r.style == 1) card.text->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
             if (r.style == 2) card.text->SetStrikethrough(TRUE, range);
             if (r.style == 3) card.text->SetFontFamilyName(L"Consolas", range);
+            if (r.style == 4) card.text->SetUnderline(TRUE, range);
         }
     }
     DWRITE_TEXT_METRICS metrics{};
@@ -2167,6 +2302,12 @@ std::wstring FindCode(const std::wstring& title, const std::wstring& body) {
     return found.size() == 1 ? found[0].second : L"";
 }
 
+// The mod's own labels: Polish when Windows is in Polish, English otherwise.
+std::wstring Text(const wchar_t* english, const wchar_t* polish) {
+    static const bool isPolish = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_POLISH;
+    return isPolish ? polish : english;
+}
+
 // The app's own copy button (Phone Link has one for codes): then the mod adds none.
 bool HasCopyButton(const std::vector<std::wstring>& buttons, const std::wstring& code) {
     for (auto name : buttons) {
@@ -2230,9 +2371,7 @@ void ApplySnapshot() {
             POINT cursor{};
             GetCursorPos(&cursor);
             g_monitor = g_settings.cursorMonitor ? MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY) : nullptr;
-            bool light = g_settings.theme == ThemeChoice::Light ||
-                         (g_settings.theme == ThemeChoice::Auto && SystemUsesLightTheme());
-            g_theme = CustomTheme(light ? kLight : kDark);
+            g_theme = CurrentTheme();
         }
         Card card;
         card.info = info;
@@ -2247,23 +2386,25 @@ void ApplySnapshot() {
             if (!code.empty() && !HasCopyButton(card.info.buttons, code)) {
                 card.code = code;
                 card.copyButton = (int)card.info.buttons.size();
-                card.info.buttons.push_back(L"Copy " + code);
+                card.info.buttons.push_back(Text(L"Copy ", L"Kopiuj ") + code);
                 Log(L"Code %s: copy button", code.c_str());
             }
         }
         card.showAvatar = g_settings.showAvatars && rule.avatar;
-        card.info.priority = card.info.priority && g_settings.highlightPriority;
+        card.waitsForUser = card.info.priority;
+        card.info.priority = card.info.priority && g_settings.highlightPriority;  // drawn with the outline
         card.shownAt = now;
         LayoutCard(card);
         g_cards.push_back(card);
     }
-    // Over the limit, the oldest cards still showing fade out.
+    // Over the limit, the oldest cards still showing fade out. Not reminders, alarms and calls: their banner is hidden
+    // too, so they would vanish while still waiting to be handled.
     int showing = (int)std::count_if(g_cards.begin(), g_cards.end(), [](const Card& c) { return !c.goneAt; });
     for (auto& card : g_cards) {
         if (showing <= g_settings.maxCards) {
             break;
         }
-        if (!card.goneAt) {
+        if (!card.goneAt && !card.waitsForUser) {
             card.goneAt = now;
             g_skipped.push_back(card.info.id);
             showing--;
@@ -2419,8 +2560,21 @@ void DrawCard(Card& card, int index, float x, float alpha) {
     for (int i = 0; i < (int)card.info.buttons.size(); i++) {
         D2D1_RECT_F button = Offset(ButtonRect(card, i), rect.left, rect.top);
         bool over = hovered && g_hover.part == Part::Button && g_hover.index == i;
+        // A pressed button squeezes and springs back (playful style).
+        D2D1_MATRIX_3X2_F before;
+        g_target->GetTransform(&before);
+        bool bounce = i == card.pressedButton && card.pressedAt && Playful();
+        if (bounce) {
+            float t = Progress(NowMs() - card.pressedAt, g_settings.pressMs);
+            float s = Keyframes(t, {{0, 1}, {0.3f, 0.92f}, {0.65f, 1.06f}, {1, 1}});
+            D2D1_POINT_2F center{(button.left + button.right) / 2, (button.top + button.bottom) / 2};
+            g_target->SetTransform(D2D1::Matrix3x2F::Scale(s, s, center) * before);
+        }
         FillRounded(button, kFieldRadius, over ? theme.fieldHover : theme.field, alpha);
         DrawString(card.info.buttons[i], g_buttonFormat, button, theme.ink, alpha);
+        if (bounce) {
+            g_target->SetTransform(before);
+        }
     }
 
     // Close button on hover, top right.
@@ -2444,9 +2598,14 @@ void DrawCard(Card& card, int index, float x, float alpha) {
 // Returns whether anything is still animating.
 bool Render() {
     ULONGLONG now = NowMs();
+    for (auto& c : g_cards) {
+        if (c.copiedAt && !c.goneAt && now - c.copiedAt >= kCopiedMs) {
+            c.goneAt = now;
+        }
+    }
     g_cards.erase(std::remove_if(g_cards.begin(), g_cards.end(),
                                  [&](Card& c) {
-                                     bool done = c.goneAt && now - c.goneAt >= g_settings.outMs;
+                                     bool done = c.goneAt && now - c.goneAt >= OutMs();
                                      if (done) {
                                          ReleaseCard(c);
                                      }
@@ -2456,13 +2615,48 @@ bool Render() {
     if (g_cards.empty()) {
         ShowWindow(g_window, SW_HIDE);
         g_hover = {};
+        // The window hid under the mouse: no WM_MOUSELEAVE may come, and the next cards mustn't wait for one.
+        if (g_holdUntil == ULLONG_MAX) {
+            g_holdUntil = GetTickCount64() + kHoverGraceMs;
+        }
         return false;
     }
 
     float scale = Scale();
-    float heightDip = kPad;
+    bool playful = Playful();
+    float layoutHeight = kPad;
     for (auto& card : g_cards) {
-        heightDip += card.height + kPad;
+        layoutHeight += card.height + kPad;
+    }
+    // Newest card next to the screen edge: at the bottom in bottom corners, at the top in top corners. Positions are
+    // kept as the distance of a card's top from that edge, so a card that changes place (playful style) glides there
+    // while the window grows or shrinks under it.
+    std::vector<float> edges(g_cards.size());
+    float heightDip = layoutHeight;
+    float y = kPad;
+    bool animating = false;
+    for (size_t n = 0; n < g_cards.size(); n++) {
+        size_t i = g_settings.top ? g_cards.size() - 1 - n : n;
+        Card& card = g_cards[i];
+        float target = g_settings.top ? y : layoutHeight - y;
+        y += card.height + kPad;
+        float edge = target;
+        if (!playful || card.edgeTo < 0) {
+            card.edgeFrom = card.edgeTo = target;
+        } else {
+            if (target != card.edgeTo) {
+                // Start the glide from wherever the card is now (also in the middle of an earlier one).
+                float glide = EaseOutBack(Progress(now - card.shiftAt, g_settings.shiftMs));
+                card.edgeFrom += (card.edgeTo - card.edgeFrom) * glide;
+                card.edgeTo = target;
+                card.shiftAt = now;
+            }
+            float t = Progress(now - card.shiftAt, g_settings.shiftMs);
+            edge = card.edgeFrom + (card.edgeTo - card.edgeFrom) * EaseOutBack(t);
+            animating |= t < 1;
+        }
+        edges[i] = edge;
+        heightDip = std::max(heightDip, g_settings.top ? edge + card.height + kPad : edge + kPad);
     }
     SIZE size{(LONG)(g_settings.width * scale + 0.5f), (LONG)(heightDip * scale + 0.5f)};
     if (size.cx != g_bitmapSize.cx || size.cy != g_bitmapSize.cy) {
@@ -2483,20 +2677,40 @@ bool Render() {
     D2D1_COLOR_F transparent{0, 0, 0, 0};
     g_target->Clear(&transparent);
 
-    bool animating = false;
     float cardWidth = g_settings.width - 2 * kPad;
-    float y = kPad;
-    // Newest card next to the screen edge: at the bottom in bottom corners, at the top in top corners.
-    for (size_t n = 0; n < g_cards.size(); n++) {
-        size_t i = g_settings.top ? g_cards.size() - 1 - n : n;
+    for (size_t i = 0; i < g_cards.size(); i++) {
         Card& card = g_cards[i];
-        card.top = y;
-        float in = EaseOut(Progress(now - card.shownAt, g_settings.inMs));
-        float alpha = card.goneAt ? 1 - Progress(now - card.goneAt, g_settings.outMs) : 1.0f;
-        animating |= in < 1 || card.goneAt;
-        float slide = (1 - in) * cardWidth * 1.1f;
-        DrawCard(card, (int)i, kPad + (g_settings.left ? -slide : slide), alpha);
-        y += card.height + kPad;
+        card.top = g_settings.top ? edges[i] : heightDip - edges[i];
+        animating |= card.goneAt || card.copiedAt || (card.pressedAt && now - card.pressedAt < g_settings.pressMs);
+        if (!playful) {
+            float in = EaseOut(Progress(now - card.shownAt, g_settings.inMs));
+            float alpha = card.goneAt ? 1 - Progress(now - card.goneAt, g_settings.outMs) : 1.0f;
+            animating |= in < 1;
+            float slide = (1 - in) * cardWidth * 1.1f;
+            DrawCard(card, (int)i, kPad + (g_settings.left ? -slide : slide), alpha);
+            continue;
+        }
+        // Bubble: grows out of the corner nearest the screen corner with a little tilt, bursts back into it.
+        float pop, turn, alpha;
+        float in = Progress(now - card.shownAt, g_settings.popInMs);
+        animating |= in < 1;
+        if (card.goneAt) {
+            float out = Progress(now - card.goneAt, g_settings.popOutMs);
+            pop = Keyframes(out, {{0, 1}, {0.35f, 1.05f}, {1, 0}});
+            alpha = Keyframes(out, {{0, 1}, {0.35f, 1}, {1, 0}});
+            turn = 0;
+        } else {
+            pop = Keyframes(in, {{0, 0.2f}, {0.6f, 1.06f}, {0.82f, 0.98f}, {1, 1}});
+            turn = Keyframes(in, {{0, 8}, {0.6f, -1.5f}, {1, 0}});
+            alpha = Keyframes(in, {{0, 0}, {0.6f, 1}, {1, 1}});
+        }
+        if (g_settings.left != g_settings.top) {
+            turn = -turn;  // tilt away from the screen corner on either side
+        }
+        D2D1_POINT_2F origin{g_settings.left ? kPad : kPad + cardWidth, g_settings.top ? card.top : card.top + card.height};
+        g_target->SetTransform(D2D1::Matrix3x2F::Scale(pop, pop, origin) * D2D1::Matrix3x2F::Rotation(turn, origin));
+        DrawCard(card, (int)i, kPad, std::clamp(alpha, 0.0f, 1.0f));
+        g_target->SetTransform(D2D1::Matrix3x2F::Identity());
     }
     g_target->EndDraw();
 
@@ -2590,11 +2804,20 @@ void StartTyping(HWND hwnd, Card& card) {
 // A pressed button goes at once; the worker presses it on the banner or in the notification center meanwhile.
 // Skipped, so the toast doesn't get a card again while Windows still has it (e.g. after Snooze).
 void SendReply(Card& card, int button) {
+    if (!card.copiedAt) {
+        card.pressedButton = button;
+        card.pressedAt = NowMs();
+    }
     if (button == card.copyButton) {
-        // The mod's own button: the code goes to the clipboard and the card closes, the toast stays in the center.
-        CopyText(g_window, card.code);
+        // The mod's own button: the code goes to the clipboard, the button says so for a moment, then the card
+        // closes (Render); the toast stays in the center.
+        if (card.copiedAt) {
+            return;
+        }
+        bool ok = CopyText(g_window, card.code);
+        card.info.buttons[button] = ok ? Text(L"Copied ✓", L"Skopiowano ✓") : Text(L"Copy failed", L"Nie skopiowano");
         card.info.inputFocused = false;
-        card.goneAt = NowMs();
+        card.copiedAt = NowMs();
         EndTyping();
         return;
     }
@@ -2623,9 +2846,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             Log(L"Watching ShellExperienceHost %lu", g_shellPid.load());
             return 0;
         case WM_APP_SETTINGS:
-            // Size and lines change the layout of the cards already shown.
+            // Size, lines, colors and avatars change the cards already shown.
             LoadSettings();
+            g_theme = CurrentTheme();
             for (auto& card : g_cards) {
+                card.showAvatar = g_settings.showAvatars && RuleFor(card.info.app).avatar;
                 ReleaseCard(card);
                 card.title = card.text = nullptr;
                 card.avatar = nullptr;
@@ -2663,6 +2888,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     SendCommand(card, hit.part == Part::Body ? Action::Open : Action::Dismiss);
                     card.info.inputFocused = false;
                     card.goneAt = NowMs();
+                    g_skipped.push_back(card.info.id);  // the banner may still list it: no new card for it
                     break;
                 case Part::Button:
                     SendReply(card, hit.index);
@@ -2819,7 +3045,13 @@ DWORD WINAPI UiThread(LPVOID) {
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = (HINSTANCE)&__ImageBase;
     wc.lpszClassName = kWindowClass;
-    if (!CreateResources()) {
+    // The card window hides the banners (SetWindowPos_Hook), so it comes only once the worker can read toasts; if the
+    // worker ends first (no UI Automation), the normal banners stay.
+    HANDLE waits[] = {g_stopEvent, g_workerReady, g_workerThread};
+    bool workerReady = WaitForMultipleObjects(3, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1;
+    if (!workerReady) {
+        Log(L"No card window: the worker didn't start");
+    } else if (!CreateResources()) {
         Log(L"Direct2D/DirectWrite unavailable");
     } else if (!RegisterClassW(&wc)) {
         Log(L"Registering the window class failed (%lu)", GetLastError());
@@ -2865,12 +3097,17 @@ DWORD WINAPI UiThread(LPVOID) {
 bool StartCards() {
     g_stopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     g_wakeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (!g_stopEvent || !g_wakeEvent) {
+    g_workerReady = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!g_stopEvent || !g_wakeEvent || !g_workerReady) {
+        return false;
+    }
+    // The worker first: the card thread waits for it (see UiThread).
+    g_workerThread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+    if (!g_workerThread) {
         return false;
     }
     g_uiThread = CreateThread(nullptr, 0, UiThread, nullptr, 0, nullptr);
-    g_workerThread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
-    return g_uiThread && g_workerThread;
+    return g_uiThread != nullptr;
 }
 
 // Both threads end soon after the stop event: the card thread waits on it, the worker checks it between toasts
@@ -2881,7 +3118,7 @@ void StopCards() {
     if (g_stopEvent) {
         SetEvent(g_stopEvent);
     }
-    for (HANDLE* handle : {&g_uiThread, &g_workerThread, &g_wakeEvent, &g_stopEvent}) {
+    for (HANDLE* handle : {&g_uiThread, &g_workerThread, &g_wakeEvent, &g_workerReady, &g_stopEvent}) {
         if (*handle) {
             if (handle == &g_uiThread || handle == &g_workerThread) {
                 WaitForSingleObject(*handle, INFINITE);
