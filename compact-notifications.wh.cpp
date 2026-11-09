@@ -162,6 +162,9 @@ banners back.
   - copyCodes: true
     $name: Copy button for codes
     $description: A notification with a one-time code (for example an SMS from Phone Link) gets a button that copies the code, unless the app already has its own copy button.
+  - copyInSystemLanguage: true
+    $name: Copy button in the Windows language
+    $description: The button says "Copy" in the language of Windows (the word Windows uses in its own menus). Turn off for English.
   - markdown: true
     $name: Format chat text
     $description: Shows **bold**, *italic*, __underline__, ~~strike~~ and `code` as chat apps (Discord, Slack, Teams) mean them, instead of the raw marks. Turn off if an app's text loses characters (e.g. file names like __init__.py).
@@ -1802,6 +1805,7 @@ struct Settings {
     bool showActions = true;
     bool highlightPriority = true;
     bool copyCodes = true;
+    bool copyInSystemLanguage = true;
     bool markdown = true;
     UINT32 priorityColor = 0xF0A020;  // reminders, alarms, calls
     std::vector<AppRule> rules;
@@ -1850,6 +1854,7 @@ void LoadSettings() {
     s.showActions = Wh_GetIntSetting(L"behavior.showActions") != 0;
     s.highlightPriority = Wh_GetIntSetting(L"behavior.highlightPriority") != 0;
     s.copyCodes = Wh_GetIntSetting(L"behavior.copyCodes") != 0;
+    s.copyInSystemLanguage = Wh_GetIntSetting(L"behavior.copyInSystemLanguage") != 0;
     s.markdown = Wh_GetIntSetting(L"behavior.markdown") != 0;
     if (UINT32 color = ColorSetting(L"behavior.priorityColor"); color != kNoColor) {
         s.priorityColor = color;
@@ -2302,10 +2307,32 @@ std::wstring FindCode(const std::wstring& title, const std::wstring& body) {
     return found.size() == 1 ? found[0].second : L"";
 }
 
-// The mod's own labels: Polish when Windows is in Polish, English otherwise.
-std::wstring Text(const wchar_t* english, const wchar_t* polish) {
-    static const bool isPolish = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_POLISH;
-    return isPolish ? polish : english;
+// "Copy" in the Windows display language: the Copy item of the standard edit-box context menu
+// (user32.dll menu 1, item id WM_COPY), without the '&' and the "\tCtrl+C". English if not found.
+const std::wstring& SystemCopyWord() {
+    static const std::wstring word = [] {
+        std::wstring result = L"Copy";
+        if (HMENU menu = LoadMenuW(GetModuleHandleW(L"user32.dll"), MAKEINTRESOURCEW(1))) {
+            wchar_t buf[64] = {};
+            HMENU sub = GetSubMenu(menu, 0);
+            if (sub && GetMenuStringW(sub, WM_COPY, buf, ARRAYSIZE(buf), MF_BYCOMMAND) > 0) {
+                std::wstring text;
+                for (auto c : std::wstring(buf)) {
+                    if (c == L'\t') break;
+                    if (c != L'&') text += c;
+                }
+                while (!text.empty() && iswspace(text.back())) text.pop_back();
+                if (!text.empty()) result = text;
+            }
+            DestroyMenu(menu);
+        }
+        return result;
+    }();
+    return word;
+}
+
+std::wstring CopyWord() {
+    return g_settings.copyInSystemLanguage ? SystemCopyWord() : L"Copy";
 }
 
 // The app's own copy button (Phone Link has one for codes): then the mod adds none.
@@ -2314,7 +2341,10 @@ bool HasCopyButton(const std::vector<std::wstring>& buttons, const std::wstring&
         for (auto& c : name) c = towlower(c);
         std::wstring digits;
         for (auto c : name) if (iswdigit(c)) digits += c;
+        std::wstring word = SystemCopyWord();
+        for (auto& c : word) c = towlower(c);
         if (name.find(L"cop") != std::wstring::npos || name.find(L"kopi") != std::wstring::npos ||
+            name.find(word) != std::wstring::npos ||
             (!code.empty() && digits.find(code) != std::wstring::npos)) {
             return true;
         }
@@ -2386,7 +2416,7 @@ void ApplySnapshot() {
             if (!code.empty() && !HasCopyButton(card.info.buttons, code)) {
                 card.code = code;
                 card.copyButton = (int)card.info.buttons.size();
-                card.info.buttons.push_back(Text(L"Copy ", L"Kopiuj ") + code);
+                card.info.buttons.push_back(CopyWord() + L" " + code);
                 Log(L"Code %s: copy button", code.c_str());
             }
         }
@@ -2815,7 +2845,7 @@ void SendReply(Card& card, int button) {
             return;
         }
         bool ok = CopyText(g_window, card.code);
-        card.info.buttons[button] = ok ? Text(L"Copied ✓", L"Skopiowano ✓") : Text(L"Copy failed", L"Nie skopiowano");
+        card.info.buttons[button] = ok ? std::wstring(L"✓") : std::wstring(L"✗");
         card.info.inputFocused = false;
         card.copiedAt = NowMs();
         EndTyping();
