@@ -28,6 +28,8 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
 
 * **Click** a card to do what clicking the original notification does (open the app or the conversation).
 * **×** (on hover) closes the card; the notification stays in the notification center.
+* **Moon** (on hover, top left) mutes the app for 15 min, 1 h, 8 h or 24 h: its cards go and its next
+  notifications only go to the notification center. Kept in memory, so restarting Explorer or the mod ends it.
 * **Buttons** from the notification (for example *Reply*, *Snooze*, *Dismiss*) are shown under the text.
 * **Codes**: a notification with a one-time code (e.g. an SMS from Phone Link) gets a *Copy 123456* button,
   unless the app has its own copy button. Its label is in Polish when Windows is, in English otherwise.
@@ -1960,7 +1962,30 @@ Theme CurrentTheme() {
     return CustomTheme(light ? kLight : kDark);
 }
 
-enum class Part { None, Body, Close, Button, Input };
+enum class Part { None, Body, Close, Mute, MuteChoice, Button, Input };
+
+// The moon button's list of times (an in-card list: a popup menu in explorer.exe comes up empty).
+struct MuteTime {
+    const wchar_t* label;
+    ULONGLONG minutes;
+};
+constexpr MuteTime kMuteTimes[] = {{L"15 min", 15}, {L"1 h", 60}, {L"8 h", 8 * 60}, {L"24 h", 24 * 60}};
+constexpr int kMuteTimeCount = (int)(sizeof(kMuteTimes) / sizeof(kMuteTimes[0]));
+constexpr float kMuteLabelLeft = 30, kMuteLabelWidth = 72;
+
+// Apps muted from a card's moon button, until a tick count (GetTickCount64). Only in memory: a restart clears it.
+std::vector<std::pair<std::wstring, ULONGLONG>> g_muted;
+
+bool AppMuted(const std::wstring& app) {
+    ULONGLONG now = GetTickCount64();
+    std::erase_if(g_muted, [&](const auto& m) { return m.second <= now; });
+    return std::any_of(g_muted.begin(), g_muted.end(),
+                       [&](const auto& m) { return _wcsicmp(m.first.c_str(), app.c_str()) == 0; });
+}
+
+bool PolishUI() {
+    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_POLISH;
+}
 
 struct Hit {
     int card = -1;
@@ -1989,7 +2014,20 @@ struct Card {
     ULONGLONG shiftAt = 0;
     int pressedButton = -1;  // bounces for a moment after a press
     ULONGLONG pressedAt = 0;
+    bool muteOpen = false;  // the moon button's list of times covers the card
+    ULONGLONG mutedAt = 0;  // a time was picked: the card says until when for a moment, then goes
+    std::wstring mutedNote;
 };
+
+constexpr ULONGLONG kMutedMs = 1800;
+
+// A time in the open mute list, in card coordinates: one row, between the label and the close button.
+D2D1_RECT_F MuteChoiceRect(const Card& card, int index, float cardWidth) {
+    float left = kMuteLabelLeft + kMuteLabelWidth, right = cardWidth - 30;
+    float width = (right - left - kButtonGap * (kMuteTimeCount - 1)) / kMuteTimeCount;
+    float x = left + index * (width + kButtonGap), y = card.height / 2 - kFieldHeight / 2;
+    return {x, y, x + width, y + kFieldHeight};
+}
 
 constexpr ULONGLONG kCopiedMs = 900;
 
@@ -2006,6 +2044,8 @@ IDWriteTextFormat* g_titleFormat = nullptr;
 IDWriteTextFormat* g_textFormat = nullptr;
 IDWriteTextFormat* g_letterFormat = nullptr;
 IDWriteTextFormat* g_buttonFormat = nullptr;  // centered, one line
+IDWriteTextFormat* g_iconFormat = nullptr;    // Segoe Fluent Icons (MDL2 Assets on older systems), centered
+IDWriteTextFormat* g_bigIconFormat = nullptr; // the same, avatar-sized
 IDWriteTextFormat* g_fieldFormat = nullptr;   // reply box: left, vertically centered, one line
 ID2D1DCRenderTarget* g_target = nullptr;
 HDC g_memDC = nullptr;
@@ -2375,7 +2415,8 @@ void ApplySnapshot() {
     ULONGLONG now = NowMs();
     for (auto& card : g_cards) {
         // A card being typed into stays until the typing ends (EndTyping applies the snapshot again).
-        bool live = card.info.inputFocused ||
+        // A just-muted card keeps its note for kMutedMs (Render closes it).
+        bool live = card.info.inputFocused || card.mutedAt ||
                     std::any_of(snapshot.begin(), snapshot.end(), [&](const ToastInfo& t) { return t.id == card.info.id; });
         if (!live && !card.goneAt) {
             card.goneAt = now;
@@ -2392,7 +2433,7 @@ void ApplySnapshot() {
             continue;
         }
         AppRule rule = RuleFor(info.app);
-        if (rule.mute) {
+        if (rule.mute || AppMuted(info.app)) {
             g_skipped.push_back(info.id);
             continue;
         }
@@ -2482,7 +2523,7 @@ void DrawCard(Card& card, int index, float x, float alpha) {
     float cardWidth = g_settings.width - 2 * kPad;
     D2D1_RECT_F rect{x, card.top, x + cardWidth, card.top + card.height};
     bool live = !card.goneAt;
-    bool hovered = live && g_hover.card == index;
+    bool hovered = live && !card.mutedAt && g_hover.card == index;
 
     // Soft shadow: a few widening, fading layers (box-shadow: 0 4px 14px rgba(0,0,0,.35)).
     for (int layer = 4; layer >= 1; layer--) {
@@ -2607,6 +2648,35 @@ void DrawCard(Card& card, int index, float x, float alpha) {
         }
     }
 
+    // Just muted: a moon in the avatar's place and until when, over the card's content.
+    if (card.mutedAt) {
+        FillRounded(rect, g_settings.radius, theme.card, alpha);
+        float cx = rect.left + kCardPadX + kAvatar / 2, cy = rect.top + card.height / 2;
+        FillRounded({cx - kAvatar / 2, cy - kAvatar / 2, cx + kAvatar / 2, cy + kAvatar / 2}, kAvatar / 2, theme.field,
+                    alpha);
+        if (g_bigIconFormat) {
+            DrawString(L"\xE708", g_bigIconFormat, {cx - kAvatar / 2, cy - kAvatar / 2, cx + kAvatar / 2, cy + kAvatar / 2},
+                       theme.ink, alpha);
+        }
+        float textLeft = rect.left + kCardPadX + kAvatar + kGap;
+        DrawString(card.mutedNote, g_fieldFormat, {textLeft, rect.top, rect.right - kCardPadX, rect.bottom}, theme.ink,
+                   alpha);
+    }
+
+    // The open mute list covers the card's content.
+    if (hovered && card.muteOpen) {
+        FillRounded(rect, g_settings.radius, theme.card, alpha);
+        DrawString(PolishUI() ? L"Wycisz na" : L"Mute for", g_fieldFormat,
+                   {rect.left + kMuteLabelLeft, rect.top, rect.left + kMuteLabelLeft + kMuteLabelWidth, rect.bottom},
+                   theme.ink, alpha);
+        for (int i = 0; i < kMuteTimeCount; i++) {
+            D2D1_RECT_F chip = Offset(MuteChoiceRect(card, i, cardWidth), rect.left, rect.top);
+            bool over = g_hover.part == Part::MuteChoice && g_hover.index == i;
+            FillRounded(chip, kFieldRadius, over ? theme.fieldHover : theme.field, alpha);
+            DrawString(kMuteTimes[i].label, g_buttonFormat, chip, theme.ink, alpha);
+        }
+    }
+
     // Close button on hover, top right.
     if (hovered) {
         float bx = rect.right - 14, by = rect.top + 14;
@@ -2622,6 +2692,17 @@ void DrawCard(Card& card, int index, float x, float alpha) {
             g_target->DrawLine({bx + 4, by - 4}, {bx - 4, by + 4}, ink, 1.4f);
             ink->Release();
         }
+        // Mute button on hover, top left: a moon (the Do not disturb icon), opens the list of times.
+        float mx = rect.left + 14, my = rect.top + 14;
+        D2D1_ELLIPSE muteCircle{{mx, my}, 10, 10};
+        if (ID2D1SolidColorBrush* fill = Brush(g_hover.part == Part::Mute ? 0x808080 : theme.card,
+                                               g_hover.part == Part::Mute ? 0.3f : 0.85f)) {
+            g_target->FillEllipse(&muteCircle, fill);
+            fill->Release();
+        }
+        if (g_iconFormat) {
+            DrawString(L"\xE708", g_iconFormat, {mx - 10, my - 10, mx + 10, my + 10}, theme.ink, 0.8f);
+        }
     }
 }
 
@@ -2630,6 +2711,9 @@ bool Render() {
     ULONGLONG now = NowMs();
     for (auto& c : g_cards) {
         if (c.copiedAt && !c.goneAt && now - c.copiedAt >= kCopiedMs) {
+            c.goneAt = now;
+        }
+        if (c.mutedAt && !c.goneAt && now - c.mutedAt >= kMutedMs) {
             c.goneAt = now;
         }
     }
@@ -2711,7 +2795,7 @@ bool Render() {
     for (size_t i = 0; i < g_cards.size(); i++) {
         Card& card = g_cards[i];
         card.top = g_settings.top ? edges[i] : heightDip - edges[i];
-        animating |= card.goneAt || card.copiedAt || (card.pressedAt && now - card.pressedAt < g_settings.pressMs);
+        animating |= card.goneAt || card.copiedAt || card.mutedAt || (card.pressedAt && now - card.pressedAt < g_settings.pressMs);
         if (!playful) {
             float in = EaseOut(Progress(now - card.shownAt, g_settings.inMs));
             float alpha = card.goneAt ? 1 - Progress(now - card.goneAt, g_settings.outMs) : 1.0f;
@@ -2775,13 +2859,24 @@ Hit HitTest(POINT pt) {
     float x = pt.x / scale, y = pt.y / scale;
     for (size_t i = 0; i < g_cards.size(); i++) {
         const Card& card = g_cards[i];
-        if (card.goneAt || x < kPad || x >= g_settings.width - kPad || y < card.top || y >= card.top + card.height) {
+        if (card.goneAt || card.mutedAt || x < kPad || x >= g_settings.width - kPad || y < card.top || y >= card.top + card.height) {
             continue;
         }
         float cardX = x - kPad, cardY = y - card.top;
         float bx = g_settings.width - 2 * kPad - 14, by = 14;
         if ((cardX - bx) * (cardX - bx) + (cardY - by) * (cardY - by) <= 12 * 12) {
             return {(int)i, Part::Close};
+        }
+        if ((cardX - 14) * (cardX - 14) + (cardY - 14) * (cardY - 14) <= 12 * 12) {
+            return {(int)i, Part::Mute};
+        }
+        if (card.muteOpen) {  // the list covers the buttons and the reply box
+            for (int t = 0; t < kMuteTimeCount; t++) {
+                if (Inside(MuteChoiceRect(card, t, g_settings.width - 2 * kPad), cardX, cardY)) {
+                    return {(int)i, Part::MuteChoice, t};
+                }
+            }
+            return {(int)i, Part::Body};
         }
         if (card.info.hasInput && Inside(InputRect(card), cardX, cardY)) {
             return {(int)i, Part::Input};
@@ -2794,6 +2889,51 @@ Hit HitTest(POINT pt) {
         return {(int)i, Part::Body};
     }
     return {};
+}
+
+void CloseMuteLists() {
+    for (auto& card : g_cards) {
+        card.muteOpen = false;
+    }
+}
+
+// Mutes an app for a while, only in memory: its cards go (the notifications stay in the notification center) and
+// its next toasts get none until the time is up.
+// The clicked card says until when for a moment (kMutedMs), then goes; the app's other cards go at once.
+void MuteApp(Card& clicked, ULONGLONG minutes) {
+    std::wstring app = clicked.info.app;
+    std::erase_if(g_muted, [&](const auto& m) { return _wcsicmp(m.first.c_str(), app.c_str()) == 0; });
+    g_muted.push_back({app, GetTickCount64() + minutes * 60 * 1000});
+    Log(L"Muted %s for %llu min", app.c_str(), minutes);
+    ULONGLONG now = NowMs();
+    // The end time in the user's clock format (13:45 or 1:45 PM).
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER t{{ft.dwLowDateTime, ft.dwHighDateTime}};
+    t.QuadPart += minutes * 60 * 10000000ULL;
+    ft = {t.LowPart, t.HighPart};
+    FILETIME localFt;
+    SYSTEMTIME local{};
+    wchar_t clock[32] = L"";
+    if (FileTimeToLocalFileTime(&ft, &localFt) && FileTimeToSystemTime(&localFt, &local)) {
+        GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &local, nullptr, clock, ARRAYSIZE(clock));
+    }
+    clicked.mutedNote = (PolishUI() ? L"Wyciszono do " : L"Muted until ") + std::wstring(clock);
+    if (minutes >= 24 * 60) {
+        clicked.mutedNote += PolishUI() ? L" jutro" : L" tomorrow";
+    }
+    clicked.mutedAt = now;
+    clicked.muteOpen = false;
+    clicked.info.inputFocused = false;
+    g_skipped.push_back(clicked.info.id);
+    for (auto& card : g_cards) {
+        if (!card.goneAt && !card.mutedAt && _wcsicmp(card.info.app.c_str(), app.c_str()) == 0) {
+            card.info.inputFocused = false;
+            card.muteOpen = false;
+            card.goneAt = now;
+            g_skipped.push_back(card.info.id);
+        }
+    }
 }
 
 void SendCommand(const Card& card, Action action, int index = 0) {
@@ -2894,6 +3034,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             Hit hit = HitTest(POINT{(short)LOWORD(lParam), (short)HIWORD(lParam)});
             g_holdUntil = hit.card >= 0 ? ULLONG_MAX : GetTickCount64() + kHoverGraceMs;
             if (!(hit == g_hover)) {
+                if (hit.card != g_hover.card) {
+                    CloseMuteLists();
+                }
                 g_hover = hit;
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
                 TrackMouseEvent(&tme);
@@ -2904,6 +3047,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_MOUSELEAVE:
             g_holdUntil = GetTickCount64() + kHoverGraceMs;
             g_hover = {};
+            CloseMuteLists();
             Redraw();
             return 0;
         case WM_LBUTTONUP: {
@@ -2914,11 +3058,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             Card& card = g_cards[hit.card];
             switch (hit.part) {
                 case Part::Body:
+                    if (card.muteOpen) {  // a click beside the list's times only closes it
+                        card.muteOpen = false;
+                        break;
+                    }
+                    [[fallthrough]];
                 case Part::Close:
                     SendCommand(card, hit.part == Part::Body ? Action::Open : Action::Dismiss);
                     card.info.inputFocused = false;
                     card.goneAt = NowMs();
                     g_skipped.push_back(card.info.id);  // the banner may still list it: no new card for it
+                    break;
+                case Part::Mute:
+                    card.muteOpen = !card.muteOpen;
+                    break;
+                case Part::MuteChoice:
+                    MuteApp(card, kMuteTimes[hit.index].minutes);
                     break;
                 case Part::Button:
                     SendReply(card, hit.index);
@@ -3030,6 +3185,28 @@ bool CreateResources() {
     g_buttonFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     g_letterFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     g_letterFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    // Icon font for the mute button; without one the button is an empty circle.
+    IDWriteFontCollection* fonts = nullptr;
+    if (SUCCEEDED(g_dwrite->GetSystemFontCollection(&fonts, FALSE))) {
+        for (const wchar_t* family : {L"Segoe Fluent Icons", L"Segoe MDL2 Assets"}) {
+            UINT32 at = 0;
+            BOOL exists = FALSE;
+            if (SUCCEEDED(fonts->FindFamilyName(family, &at, &exists)) && exists) {
+                g_dwrite->CreateTextFormat(family, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                           DWRITE_FONT_STRETCH_NORMAL, 11, L"", &g_iconFormat);
+                g_dwrite->CreateTextFormat(family, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                           DWRITE_FONT_STRETCH_NORMAL, 18, L"", &g_bigIconFormat);
+                break;
+            }
+        }
+        fonts->Release();
+    }
+    for (IDWriteTextFormat* f : {g_iconFormat, g_bigIconFormat}) {
+        if (f) {
+            f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+    }
 
     D2D1_RENDER_TARGET_PROPERTIES props{D2D1_RENDER_TARGET_TYPE_DEFAULT,
                                         {DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED},
@@ -3056,7 +3233,7 @@ void ReleaseResources() {
     if (g_memDC) {
         DeleteDC(g_memDC);
     }
-    for (IUnknown* object : std::initializer_list<IUnknown*>{g_target, g_fieldFormat, g_buttonFormat, g_letterFormat,
+    for (IUnknown* object : std::initializer_list<IUnknown*>{g_target, g_iconFormat, g_bigIconFormat, g_fieldFormat, g_buttonFormat, g_letterFormat,
                                                              g_textFormat, g_titleFormat, g_dwrite, g_wic, g_d2d}) {
         if (object) {
             object->Release();
