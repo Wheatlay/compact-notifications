@@ -1,4 +1,4 @@
-﻿// ==WindhawkMod==
+// ==WindhawkMod==
 // @id              compact-notifications
 // @name            Compact Notifications
 // @description     Replaces Windows notification banners with compact chat-style cards: avatar, sender and a few lines of text
