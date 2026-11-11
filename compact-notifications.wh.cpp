@@ -33,7 +33,7 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
   the mod ends them; ∞ is saved and lasts until you flip *Unmute apps muted for good* in the settings.
 * **Buttons** from the notification (for example *Reply*, *Snooze*, *Dismiss*) are shown under the text.
 * **Codes**: a notification with a one-time code (e.g. an SMS from Phone Link) gets a *Copy 123456* button,
-  unless the app has its own copy button. Its label is in Polish when Windows is, in English otherwise.
+  unless the app has its own copy button. It says "Copy" in the language of Windows (or in English, see the settings).
 * **Reply box**: click it and type, then press the app's send button (or Enter). The text goes into the
   original reply box together with the button press, so the app receives it as usual.
 * **Avatars**: the notification's image (local files and images from Store apps), or a thumbnail of its
@@ -661,7 +661,9 @@ std::wstring ImageFromPayload(const std::string& payload, const std::wstring& au
             return {};
         }
         if (starts(L"file:///")) {
-            return after(L"file:///");
+            // Local drives only: a network path (file://///server/share) would be opened over SMB.
+            std::wstring path = after(L"file:///");
+            return path.size() > 2 && path[1] == L':' ? path : std::wstring();
         }
         std::replace(src.begin(), src.end(), L'/', L'\\');
         return src.size() > 2 && src[1] == L':' ? src : std::wstring();
@@ -772,7 +774,7 @@ std::wstring AppIcon(const std::wstring& app) {
         }
         size = sizeof(value);
         if (RegGetValueW(root, name, L"IconUri", RRF_RT_REG_SZ, nullptr, value, &size) == ERROR_SUCCESS &&
-            FileExists(value)) {
+            value[1] == L':' && FileExists(value)) {  // local drives only, no network paths
             icon = value;
         }
     }
@@ -1212,7 +1214,8 @@ HWND ForegroundCenter() {
     HWND hwnd = GetForegroundWindow();
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    return hwnd && pid == g_shellPid && IsCoreWindowClass(hwnd) && !IsBannerTitle(hwnd) ? hwnd : nullptr;
+    return hwnd && IsCoreWindowClass(hwnd) && !IsBannerTitle(hwnd) && ProcessIsShellExperienceHost(pid) ? hwnd
+                                                                                                         : nullptr;
 }
 
 // Windows keeps the center where it last was and doesn't place it again when it opens, so the mod moves it back after
@@ -1234,7 +1237,9 @@ int CenterHomeX(HWND hwnd) {
 void RestoreCenter(HWND hwnd) {
     RECT rc;
     if (hwnd && GetWindowRect(hwnd, &rc) && rc.left >= OffscreenX() - 200) {
-        SetWindowPos(hwnd, nullptr, CenterHomeX(hwnd), rc.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        // Async: a hung ShellExperienceHost must not block the worker (and with it the mod's unload).
+        SetWindowPos(hwnd, nullptr, CenterHomeX(hwnd), rc.top, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
 }
 
@@ -1261,7 +1266,8 @@ HWND OpenCenter() {
             RECT rc;
             if (GetWindowRect(hwnd, &rc) && rc.left < OffscreenX() - 200) {
                 g_centerX = rc.left;
-                SetWindowPos(hwnd, nullptr, OffscreenX(), rc.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                SetWindowPos(hwnd, nullptr, OffscreenX(), rc.top, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
             }
             return hwnd;
         }
@@ -1269,10 +1275,16 @@ HWND OpenCenter() {
     }
     Log(L"The notification center didn't open");
     SetCenterHidden(false);
+    RestoreLostCenter(BannerProcess());  // the hook may have moved it off the screen meanwhile
     return nullptr;
 }
 
 void CloseCenter(HWND hwnd) {
+    // Opening an item closes the center by itself (and the app takes the foreground): Esc only for a center that is
+    // still open after that, so it never reaches the app.
+    for (int i = 0; i < 25 && ForegroundCenter() == hwnd; i++) {
+        Sleep(20);
+    }
     if (ForegroundCenter() == hwnd) {
         PressKeys({VK_ESCAPE});
         Sleep(300);  // closing animation, still off the screen
@@ -1576,7 +1588,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
             for (auto& info : stored) {
                 bool shown = std::any_of(known.begin(), known.end(),
                                          [&](const Known& k) { return SameToast(info, k.info.title, k.info.text); });
-                Log(L"Stored toast %s: %s / %s%s", info.app.c_str(), info.title.c_str(), info.text.c_str(),
+                Log(L"Stored toast %s: %s (%zu chars)%s", info.app.c_str(), info.title.c_str(), info.text.size(),
                     shown ? L" (already on the banner)" : L"");
                 if (!shown) {
                     pending.push_back({info, now + cardMs()});
@@ -1592,7 +1604,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
             for (auto it = pending.begin(); it != pending.end();) {
                 // The app took its toast back (a call answered or declined in the app, a message read): no card.
                 if (it->info.arrival && std::find(taken.begin(), taken.end(), it->info.arrival) != taken.end()) {
-                    Log(L"Stored toast removed by the app: %s / %s", it->info.title.c_str(), it->info.text.c_str());
+                    Log(L"Stored toast removed by the app: %s", it->info.title.c_str());
                     it = pending.erase(it);
                     continue;
                 }
@@ -1698,8 +1710,8 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                 info.hasInput = !edits.empty();
                                 release(edits);
                                 info.placeholder = ChildName(element, editCondition.p);
-                                Log(L"Toast %s: %s / %s [%s] %d buttons%s%s", info.app.c_str(), info.title.c_str(),
-                                    info.text.c_str(), info.image.c_str(), (int)info.buttons.size(),
+                                Log(L"Toast %s: %s (%zu chars) [%s] %d buttons%s%s", info.app.c_str(), info.title.c_str(),
+                                    info.text.size(), info.image.c_str(), (int)info.buttons.size(),
                                     info.hasInput ? L", reply box" : L"",
                                     hidden                              ? L" (its card already went)"
                                     : info.id.rfind(L"stored#", 0) == 0 ? L" (continues its card)"
@@ -1987,24 +1999,21 @@ constexpr float kMuteLabelLeft = 30, kMuteLabelWidth = 64;
 // Apps muted from a card's moon button for a while, until a tick count (GetTickCount64). Only in memory: a restart
 // clears it.
 std::vector<std::pair<std::wstring, ULONGLONG>> g_muted;
-// Apps muted for good (∞), saved in the mod's storage as one name per line. Flipping the "unmuteAll" setting (either
-// way) empties the list: its last seen value is stored too, and LoadSettings compares them.
+// Apps muted for good (∞), saved in the mod's storage as one value per app (mutedForever0, 1, ...) and a count: the
+// portable version keeps storage in an INI file, which can't hold line breaks. Flipping the "unmuteAll" setting
+// (either way) empties the list: its last seen value is stored too, and LoadSettings compares them.
 std::vector<std::wstring> g_mutedForever;
-constexpr wchar_t kMutedForeverKey[] = L"mutedForever";
+constexpr wchar_t kMutedForeverCountKey[] = L"mutedForeverCount";
 constexpr wchar_t kUnmuteSeenKey[] = L"unmuteAllSeen";
 
-constexpr size_t kMutedForeverMax = 4096;  // characters, the buffer LoadMutedForever reads into
-
 void SaveMutedForever() {
-    std::wstring value;
+    int count = 0;
     for (const std::wstring& app : g_mutedForever) {
-        value += app + L"\n";
+        WCHAR name[32];
+        swprintf_s(name, L"mutedForever%d", count++);
+        Wh_SetStringValue(name, app.c_str());
     }
-    // The oldest names go first if the list wouldn't fit the read buffer (a cut name would match no app).
-    while (value.size() >= kMutedForeverMax) {
-        value.erase(0, value.find(L'\n') + 1);
-    }
-    Wh_SetStringValue(kMutedForeverKey, value.c_str());
+    Wh_SetIntValue(kMutedForeverCountKey, count);
 }
 
 void LoadMutedForever() {
@@ -2012,17 +2021,15 @@ void LoadMutedForever() {
     int unmuteAll = Wh_GetIntSetting(L"behavior.unmuteAll") != 0;
     if (Wh_GetIntValue(kUnmuteSeenKey, 0) != unmuteAll) {
         Wh_SetIntValue(kUnmuteSeenKey, unmuteAll);
-        Wh_SetStringValue(kMutedForeverKey, L"");
+        Wh_SetIntValue(kMutedForeverCountKey, 0);
         Log(L"Unmuted all apps muted for good");
         return;
     }
-    WCHAR value[kMutedForeverMax] = L"";
-    Wh_GetStringValue(kMutedForeverKey, value, ARRAYSIZE(value));
-    for (const WCHAR* p = value; *p;) {
-        const WCHAR* end = wcschr(p, L'\n');
-        std::wstring app(p, end ? end - p : wcslen(p));
-        p = end ? end + 1 : p + app.size();
-        if (!app.empty()) {
+    int count = Wh_GetIntValue(kMutedForeverCountKey, 0);
+    for (int i = 0; i < count; i++) {
+        WCHAR name[32], app[512] = L"";
+        swprintf_s(name, L"mutedForever%d", i);
+        if (Wh_GetStringValue(name, app, ARRAYSIZE(app)) && *app) {
             g_mutedForever.push_back(app);
         }
     }
@@ -2513,7 +2520,7 @@ void ApplySnapshot() {
                 card.code = code;
                 card.copyButton = (int)card.info.buttons.size();
                 card.info.buttons.push_back(CopyWord() + L" " + code);
-                Log(L"Code %s: copy button", code.c_str());
+                Log(L"Code found: copy button");
             }
         }
         card.showAvatar = g_settings.showAvatars && rule.avatar;
