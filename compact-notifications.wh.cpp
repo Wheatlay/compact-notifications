@@ -28,8 +28,9 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
 
 * **Click** a card to do what clicking the original notification does (open the app or the conversation).
 * **×** (on hover) closes the card; the notification stays in the notification center.
-* **Moon** (on hover, top left) mutes the app for 15 min, 1 h, 8 h or 24 h: its cards go and its next
-  notifications only go to the notification center. Kept in memory, so restarting Explorer or the mod ends it.
+* **Moon** (on hover, top left) mutes the app for 15 min, 1 h, 8 h, 24 h or for good (∞): its cards go and its
+  next notifications only go to the notification center. Timed mutes are kept in memory, so restarting Explorer or
+  the mod ends them; ∞ is saved and lasts until you flip *Unmute apps muted for good* in the settings.
 * **Buttons** from the notification (for example *Reply*, *Snooze*, *Dismiss*) are shown under the text.
 * **Codes**: a notification with a one-time code (e.g. an SMS from Phone Link) gets a *Copy 123456* button,
   unless the app has its own copy button. Its label is in Polish when Windows is, in English otherwise.
@@ -173,6 +174,9 @@ banners back.
   - highlightPriority: true
     $name: Highlight priority notifications
     $description: Colored outline for reminders, alarms and incoming calls.
+  - unmuteAll: false
+    $name: Unmute apps muted for good
+    $description: The moon button's ∞ mutes an app until you change this switch (either way) and save.
   - priorityColor: "#F0A020"
     $name: Priority color
     $description: Hex color, for example #F0A020 (orange) or #E0102F (red).
@@ -1839,6 +1843,8 @@ AppRule RuleFor(const std::wstring& app) {
     return {};
 }
 
+void LoadMutedForever();
+
 void LoadSettings() {
     Settings s;
     std::wstring theme = StringSetting(L"appearance.theme");
@@ -1910,6 +1916,9 @@ void LoadSettings() {
         s.rules.push_back(rule);
     }
     g_settings = s;
+    if (g_explorer) {  // only the shell's Explorer draws cards; the other process needs no list
+        LoadMutedForever();
+    }
     Log(L"Settings: theme %d, size %d%%, %d lines, width %d, %s monitor, corner %s%s, actions %d, priority %d #%06X, "
         L"%d rules",
         (int)s.theme, (int)(s.zoom * 100 + 0.5f), (int)s.maxLines, (int)s.width,
@@ -1969,18 +1978,64 @@ struct MuteTime {
     const wchar_t* label;
     ULONGLONG minutes;
 };
-constexpr MuteTime kMuteTimes[] = {{L"15 min", 15}, {L"1 h", 60}, {L"8 h", 8 * 60}, {L"24 h", 24 * 60}};
+constexpr ULONGLONG kMuteForever = 0;  // minutes of the last choice (∞): kept in the mod's storage
+constexpr MuteTime kMuteTimes[] = {
+    {L"15 min", 15}, {L"1 h", 60}, {L"8 h", 8 * 60}, {L"24 h", 24 * 60}, {L"∞", kMuteForever}};
 constexpr int kMuteTimeCount = (int)(sizeof(kMuteTimes) / sizeof(kMuteTimes[0]));
-constexpr float kMuteLabelLeft = 30, kMuteLabelWidth = 72;
+constexpr float kMuteLabelLeft = 30, kMuteLabelWidth = 64;
 
-// Apps muted from a card's moon button, until a tick count (GetTickCount64). Only in memory: a restart clears it.
+// Apps muted from a card's moon button for a while, until a tick count (GetTickCount64). Only in memory: a restart
+// clears it.
 std::vector<std::pair<std::wstring, ULONGLONG>> g_muted;
+// Apps muted for good (∞), saved in the mod's storage as one name per line. Flipping the "unmuteAll" setting (either
+// way) empties the list: its last seen value is stored too, and LoadSettings compares them.
+std::vector<std::wstring> g_mutedForever;
+constexpr wchar_t kMutedForeverKey[] = L"mutedForever";
+constexpr wchar_t kUnmuteSeenKey[] = L"unmuteAllSeen";
+
+constexpr size_t kMutedForeverMax = 4096;  // characters, the buffer LoadMutedForever reads into
+
+void SaveMutedForever() {
+    std::wstring value;
+    for (const std::wstring& app : g_mutedForever) {
+        value += app + L"\n";
+    }
+    // The oldest names go first if the list wouldn't fit the read buffer (a cut name would match no app).
+    while (value.size() >= kMutedForeverMax) {
+        value.erase(0, value.find(L'\n') + 1);
+    }
+    Wh_SetStringValue(kMutedForeverKey, value.c_str());
+}
+
+void LoadMutedForever() {
+    g_mutedForever.clear();
+    int unmuteAll = Wh_GetIntSetting(L"behavior.unmuteAll") != 0;
+    if (Wh_GetIntValue(kUnmuteSeenKey, 0) != unmuteAll) {
+        Wh_SetIntValue(kUnmuteSeenKey, unmuteAll);
+        Wh_SetStringValue(kMutedForeverKey, L"");
+        Log(L"Unmuted all apps muted for good");
+        return;
+    }
+    WCHAR value[kMutedForeverMax] = L"";
+    Wh_GetStringValue(kMutedForeverKey, value, ARRAYSIZE(value));
+    for (const WCHAR* p = value; *p;) {
+        const WCHAR* end = wcschr(p, L'\n');
+        std::wstring app(p, end ? end - p : wcslen(p));
+        p = end ? end + 1 : p + app.size();
+        if (!app.empty()) {
+            g_mutedForever.push_back(app);
+        }
+    }
+}
 
 bool AppMuted(const std::wstring& app) {
+    auto same = [&](const std::wstring& other) { return _wcsicmp(other.c_str(), app.c_str()) == 0; };
+    if (std::any_of(g_mutedForever.begin(), g_mutedForever.end(), same)) {
+        return true;
+    }
     ULONGLONG now = GetTickCount64();
     std::erase_if(g_muted, [&](const auto& m) { return m.second <= now; });
-    return std::any_of(g_muted.begin(), g_muted.end(),
-                       [&](const auto& m) { return _wcsicmp(m.first.c_str(), app.c_str()) == 0; });
+    return std::any_of(g_muted.begin(), g_muted.end(), [&](const auto& m) { return same(m.first); });
 }
 
 bool PolishUI() {
@@ -2897,15 +2952,41 @@ void CloseMuteLists() {
     }
 }
 
-// Mutes an app for a while, only in memory: its cards go (the notifications stay in the notification center) and
-// its next toasts get none until the time is up.
+void MutedUntilNote(Card& clicked, ULONGLONG minutes);
+
+// Mutes an app for a while (only in memory) or for good (kMuteForever, saved): its cards go (the notifications stay
+// in the notification center) and its next toasts get none until the time is up.
 // The clicked card says until when for a moment (kMutedMs), then goes; the app's other cards go at once.
 void MuteApp(Card& clicked, ULONGLONG minutes) {
     std::wstring app = clicked.info.app;
     std::erase_if(g_muted, [&](const auto& m) { return _wcsicmp(m.first.c_str(), app.c_str()) == 0; });
-    g_muted.push_back({app, GetTickCount64() + minutes * 60 * 1000});
-    Log(L"Muted %s for %llu min", app.c_str(), minutes);
     ULONGLONG now = NowMs();
+    if (minutes == kMuteForever) {
+        g_mutedForever.push_back(app);
+        SaveMutedForever();
+        Log(L"Muted %s for good", app.c_str());
+        clicked.mutedNote = PolishUI() ? L"Wyciszono na stałe" : L"Muted for good";
+    } else {
+        g_muted.push_back({app, GetTickCount64() + minutes * 60 * 1000});
+        Log(L"Muted %s for %llu min", app.c_str(), minutes);
+        MutedUntilNote(clicked, minutes);
+    }
+    clicked.mutedAt = now;
+    clicked.muteOpen = false;
+    clicked.info.inputFocused = false;
+    g_skipped.push_back(clicked.info.id);
+    for (auto& card : g_cards) {
+        if (!card.goneAt && !card.mutedAt && _wcsicmp(card.info.app.c_str(), app.c_str()) == 0) {
+            card.info.inputFocused = false;
+            card.muteOpen = false;
+            card.goneAt = now;
+            g_skipped.push_back(card.info.id);
+        }
+    }
+}
+
+// "Muted until 13:45" (in the user's clock format), with "tomorrow" for a day.
+void MutedUntilNote(Card& clicked, ULONGLONG minutes) {
     // The end time in the user's clock format (13:45 or 1:45 PM).
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
@@ -2921,18 +3002,6 @@ void MuteApp(Card& clicked, ULONGLONG minutes) {
     clicked.mutedNote = (PolishUI() ? L"Wyciszono do " : L"Muted until ") + std::wstring(clock);
     if (minutes >= 24 * 60) {
         clicked.mutedNote += PolishUI() ? L" jutro" : L" tomorrow";
-    }
-    clicked.mutedAt = now;
-    clicked.muteOpen = false;
-    clicked.info.inputFocused = false;
-    g_skipped.push_back(clicked.info.id);
-    for (auto& card : g_cards) {
-        if (!card.goneAt && !card.mutedAt && _wcsicmp(card.info.app.c_str(), app.c_str()) == 0) {
-            card.info.inputFocused = false;
-            card.muteOpen = false;
-            card.goneAt = now;
-            g_skipped.push_back(card.info.id);
-        }
     }
 }
 
