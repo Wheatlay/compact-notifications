@@ -8,7 +8,7 @@
 // @license         GPL-3.0
 // @include         ShellExperienceHost.exe
 // @include         explorer.exe
-// @compilerOptions -lole32 -loleaut32 -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs -ladvapi32 -lshell32 -ldwmapi
+// @compilerOptions -lole32 -loleaut32 -ld2d1 -ldwrite -lshcore -lgdi32 -lwindowscodecs -ladvapi32 -lshell32 -ldwmapi -lwinmm
 // ==/WindhawkMod==
 
 // The banner detection idea comes from the "Toast auto-dismiss" mod by nikitor32 (GPL-3.0),
@@ -227,6 +227,7 @@ banners back.
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <dwmapi.h>
+#include <mmsystem.h>
 
 #include <windhawk_utils.h>
 
@@ -488,7 +489,11 @@ struct ToastInfo {
     std::wstring aumid;     // the app's id (stored toasts only), for its sound setting
     bool silent = false;    // <audio silent="true"/>
     std::wstring sound;     // sound alias from <audio src="ms-winsoundevent:...">, empty for the default
+    bool appSound = false;  // <audio src> is the app's own file: Windows plays it (it isn't under %WINDIR%\Media)
 };
+
+// The <audio> element of a toast: silent, a Windows sound event or the app's own file.
+void ReadAudio(const std::string& payload, const std::wstring& aumid, ToastInfo& info);
 
 ////////////////////////////////////////////////////////////////////////////////
 // Avatar: UI Automation doesn't expose images, so the toast XML is read from the notification database
@@ -740,7 +745,8 @@ sqlite3_stmt* Prepare(const std::string& sql) {
 }
 
 // Finds the newest stored toast whose text contains both the title and the message, and returns its avatar.
-std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
+// A card made from the banner also takes the toast's sound details from it (into audio, when given).
+std::wstring FindAvatar(const std::wstring& title, const std::wstring& text, ToastInfo* audio = nullptr) {
     // Only the start of the message: the banner can show it with other line breaks or cut off (Firefox, Gmail).
     std::wstring start = text.substr(0, std::min(text.find_first_of(L"\r\n"), (size_t)24));
     std::string wantTitle = ToUtf8(title), wantText = ToUtf8(start);
@@ -766,7 +772,13 @@ std::wstring FindAvatar(const std::wstring& title, const std::wstring& text) {
         }
         g_sqlite.finalize(stmt);
     }
-    return payload.empty() ? std::wstring() : AvatarFromPayload(payload, FromUtf8(aumid));
+    if (payload.empty()) {
+        return std::wstring();
+    }
+    if (audio) {
+        ReadAudio(payload, FromUtf8(aumid), *audio);
+    }
+    return AvatarFromPayload(payload, FromUtf8(aumid));
 }
 
 // The icon a desktop app registered for its notifications (HKCU\Software\Classes\AppUserModelId\<id>, IconUri),
@@ -897,8 +909,22 @@ bool BannerAllowed(const std::wstring& aumid) {
 // The sound for a new card, as Windows would play it for the banner (see CreateFileW_Hook): not for silent toasts,
 // with notification sounds turned off (for all apps or for this one), or for a toast that isn't fresh (cards made
 // for toasts already there when the mod starts). Looping sounds stay with the banner. Returns whether it played.
+void ReadAudio(const std::string& payload, const std::wstring& aumid, ToastInfo& info) {
+    info.aumid = aumid;
+    for (auto& [tag, content] : Elements(payload, "audio")) {
+        info.silent = Attribute(tag, "silent") == "true";
+        std::string src = Attribute(tag, "src");
+        if (src.rfind("ms-winsoundevent:", 0) == 0) {
+            info.sound = FromUtf8(src.substr(17));
+        } else {
+            info.appSound = !src.empty();
+        }
+        break;
+    }
+}
+
 bool PlayCardSound(const ToastInfo& info, const std::wstring& file) {
-    if (info.silent || info.sound.find(L"Looping") != std::wstring::npos) {
+    if (info.silent || info.appSound || info.sound.find(L"Looping") != std::wstring::npos) {
         return false;
     }
     const std::wstring settings = L"Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings";
@@ -914,22 +940,16 @@ bool PlayCardSound(const ToastInfo& info, const std::wstring& file) {
             return false;
         }
     }
-    using PlaySoundFn = BOOL(WINAPI*)(LPCWSTR, HMODULE, DWORD);
-    static PlaySoundFn playSound = (PlaySoundFn)(void*)GetProcAddress(LoadLibraryW(L"winmm.dll"), "PlaySoundW");
-    if (!playSound) {
-        return false;
-    }
-    // SND_ALIAS | SND_ASYNC | SND_NODEFAULT | SND_SYSTEM: the sound from the Windows sound scheme, on the system
-    // sounds volume, without blocking the card thread.
-    constexpr DWORD kFlags = 0x00010000 | 0x0001 | 0x0002 | 0x00200000;
-    // Own file from the settings (SND_FILENAME instead of SND_ALIAS); a missing or broken file falls back to Windows'.
-    if (!file.empty() && playSound(file.c_str(), nullptr, (kFlags & ~0x00010000) | 0x00020000)) {
+    // On the system sounds volume, without blocking the card thread, and nothing when the sound is missing.
+    constexpr DWORD kFlags = SND_ASYNC | SND_NODEFAULT | SND_SYSTEM;
+    // Own file from the settings; a missing or broken file falls back to the sound from the Windows sound scheme.
+    if (!file.empty() && PlaySoundW(file.c_str(), nullptr, kFlags | SND_FILENAME)) {
         Log(L"Card sound played (own file)");
         return true;
     }
     std::wstring alias = info.sound.empty() ? L"Notification.Default" : info.sound;
-    if (!playSound(alias.c_str(), nullptr, kFlags) && alias != L"Notification.Default") {
-        playSound(L"Notification.Default", nullptr, kFlags);
+    if (!PlaySoundW(alias.c_str(), nullptr, kFlags | SND_ALIAS) && alias != L"Notification.Default") {
+        PlaySoundW(L"Notification.Default", nullptr, kFlags | SND_ALIAS);
     }
     Log(L"Card sound played");
     return true;
@@ -964,15 +984,7 @@ ToastInfo ToastFromPayload(const std::string& payload, const std::wstring& aumid
     }
     std::string scenario = Attribute(payload.substr(0, payload.find('>')), "scenario");
     info.priority = scenario == "reminder" || scenario == "alarm" || scenario == "incomingCall" || scenario == "urgent";
-    for (auto& [tag, content] : Elements(payload, "audio")) {
-        info.silent = Attribute(tag, "silent") == "true";
-        std::string src = Attribute(tag, "src");
-        if (src.rfind("ms-winsoundevent:", 0) == 0) {
-            info.sound = FromUtf8(src.substr(17));
-        }
-        break;
-    }
-    info.aumid = aumid;
+    ReadAudio(payload, aumid, info);
     info.app = AppName(aumid);
     info.image = AvatarFromPayload(payload, aumid);
     if (info.image.empty()) {
@@ -1744,6 +1756,10 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                 info.id = waiting->info.id;
                                 info.arrival = waiting->info.arrival;
                                 image = waiting->info.image;
+                                info.aumid = waiting->info.aumid;
+                                info.silent = waiting->info.silent;
+                                info.sound = waiting->info.sound;
+                                info.appSound = waiting->info.appSound;
                                 until = waiting->until;
                                 pending.erase(waiting);
                             } else if (gone != expired.end()) {
@@ -1759,7 +1775,7 @@ DWORD WINAPI WorkerThread(LPVOID) {
                                 hidden = old->hidden;
                                 until = old->until;
                             } else {
-                                info.image = !image.empty() ? image : FindAvatar(info.title, info.text);
+                                info.image = !image.empty() ? image : FindAvatar(info.title, info.text, &info);
                                 if (info.image.empty()) {
                                     info.image = AppIcon(info.app);
                                 }
@@ -1900,6 +1916,9 @@ struct Settings {
     std::vector<AppRule> rules;
 } g_settings;
 
+// The sound mode for CreateFileW_Hook, which runs on ShellExperienceHost's threads while settings load on another.
+std::atomic<int> g_soundMode{0};
+
 std::wstring StringSetting(const wchar_t* name) {
     return WindhawkUtils::StringSetting(Wh_GetStringSetting(name)).get();
 }
@@ -1949,6 +1968,7 @@ void LoadSettings() {
     s.markdown = Wh_GetIntSetting(L"behavior.markdown") != 0;
     std::wstring soundMode = StringSetting(L"sound.mode");
     s.soundMode = soundMode == L"windows" ? 1 : soundMode == L"off" ? 2 : 0;
+    g_soundMode = s.soundMode;
     s.soundFile = StringSetting(L"sound.file");
     if (s.soundFile.size() >= 2 && s.soundFile.front() == L'"' && s.soundFile.back() == L'"') {
         s.soundFile = s.soundFile.substr(1, s.soundFile.size() - 2);  // "Copy as path" adds quotes
@@ -3507,17 +3527,17 @@ using CreateFileW_t = decltype(&CreateFileW);
 CreateFileW_t CreateFileW_Original;
 HANDLE WINAPI CreateFileW_Hook(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition,
                                DWORD flags, HANDLE templateFile) {
-    if (name) {
+    static const std::wstring media = [] {
+        WCHAR dir[MAX_PATH];
+        UINT n = GetWindowsDirectoryW(dir, ARRAYSIZE(dir));
+        return n && n < ARRAYSIZE(dir) ? std::wstring(dir) + L"\\Media\\" : std::wstring();
+    }();
+    if (name && !media.empty() && g_soundMode != 1) {
         size_t n = wcslen(name);
-        const WCHAR* file = wcsrchr(name, L'\\');
-        file = file ? file + 1 : name;
-        bool inMedia = false;
-        for (const WCHAR* p = name; *p && !inMedia; p++) {
-            inMedia = _wcsnicmp(p, L"\\Media\\", 7) == 0;
-        }
-        if (n > 4 && _wcsicmp(name + n - 4, L".wav") == 0 && inMedia &&
-            _wcsnicmp(file, L"Alarm", 5) != 0 && _wcsnicmp(file, L"Ring", 4) != 0 && g_settings.soundMode != 1 &&
-            FindWindowW(kWindowClass, nullptr)) {
+        const WCHAR* file = name + std::min(n, media.size());
+        if (n > media.size() + 4 && _wcsnicmp(name, media.c_str(), media.size()) == 0 &&
+            _wcsicmp(name + n - 4, L".wav") == 0 && !wcschr(file, L'\\') && _wcsnicmp(file, L"Alarm", 5) != 0 &&
+            _wcsnicmp(file, L"Ring", 4) != 0 && FindWindowW(kWindowClass, nullptr)) {
             Log(L"Banner sound muted");
             SetLastError(ERROR_FILE_NOT_FOUND);
             return INVALID_HANDLE_VALUE;
@@ -3539,7 +3559,10 @@ BOOL Wh_ModInit() {
     }
     WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook, &SetWindowPos_Original);
     if (!explorer) {
-        WindhawkUtils::SetFunctionHook(CreateFileW, CreateFileW_Hook, &CreateFileW_Original);
+        // kernelbase's export: kernel32's CreateFileW is only a stub, and most Windows DLLs call kernelbase directly.
+        if (auto createFile = (CreateFileW_t)(void*)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "CreateFileW")) {
+            WindhawkUtils::SetFunctionHook(createFile, CreateFileW_Hook, &CreateFileW_Original);
+        }
     }
     g_explorer = explorer;
     Log(L"Loaded in %s", base);
@@ -3555,7 +3578,9 @@ void Wh_ModAfterInit() {
 }
 
 void Wh_ModSettingsChanged() {
-    if (HWND window = g_window) {
+    if (!g_explorer) {
+        LoadSettings();  // ShellExperienceHost: only the sound mode matters here (see g_soundMode)
+    } else if (HWND window = g_window) {
         PostMessage(window, WM_APP_SETTINGS, 0, 0);
     }
 }
