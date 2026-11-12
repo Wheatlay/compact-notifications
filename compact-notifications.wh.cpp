@@ -2,7 +2,7 @@
 // @id              compact-notifications
 // @name            Compact Notifications
 // @description     Replaces Windows notification banners with compact chat-style cards: avatar, sender and a few lines of text
-// @version         1.1
+// @version         1.2
 // @author          Wheatlay
 // @github          https://github.com/Wheatlay
 // @license         GPL-3.0
@@ -43,6 +43,9 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
   the card limit never pushes them out.
 * **Chat formatting**: \*\*bold\*\*, \*italic\*, \_\_underline\_\_, \~\~strike\~\~ and \`code\` left in the text by
   chat apps are shown formatted (can be turned off).
+* **Sound** plays when the card shows, not when Windows gets to the notification's banner later, so a few
+  messages in a row don't keep chiming after their cards are gone. It is the sound Windows would play (or your
+  own .wav), and it follows the Windows settings: no sound for silent notifications or apps with sound turned off.
 
 ## Settings
 
@@ -51,6 +54,7 @@ cards with a round avatar, the sender in bold and up to a few lines of text, sli
 * **Avatars**: on or off, circle, rounded square or square, the app's name before the sender.
 * **Animation**: on or off, playful or plain, speed, how many cards show at once.
 * **Position**: monitor and corner.
+* **Sound**: when the card shows, as Windows plays it, or none; your own sound file.
 * **Per-app rules**: for a single app (by the name shown on its notifications), hide the buttons, the reply
   box or the avatar, or don't show cards for it at all; its notifications still go to the notification center.
 
@@ -181,6 +185,18 @@ banners back.
     $name: Priority color
     $description: Hex color, for example #F0A020 (orange) or #E0102F (red).
   $name: Behavior
+- sound:
+  - mode: card
+    $name: Notification sound
+    $options:
+    - card: When the card shows
+    - windows: As Windows plays it (when its banner would show, can come after the card is gone)
+    - off: No sound
+    $description: Reminders, alarms and calls keep their looping sound from Windows either way.
+  - file: ""
+    $name: Sound file
+    $description: Full path to a .wav file played instead of the Windows sound, e.g. C:\Users\Me\ding.wav. Empty uses the sound from the Windows sound scheme. Only with "When the card shows".
+  $name: Sound
 - appRules:
   - - app: ""
       $name: App name
@@ -469,6 +485,9 @@ struct ToastInfo {
     std::wstring inputValue;  // the reply typed on the card (the card thread's own state)
     bool inputFocused = false;
     bool priority = false;  // reminders, alarms, calls: they stay until handled
+    std::wstring aumid;     // the app's id (stored toasts only), for its sound setting
+    bool silent = false;    // <audio silent="true"/>
+    std::wstring sound;     // sound alias from <audio src="ms-winsoundevent:...">, empty for the default
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -875,6 +894,47 @@ bool BannerAllowed(const std::wstring& aumid) {
            UserDword(settings + L"\\" + aumid, L"Enabled", 1) && UserDword(settings + L"\\" + aumid, L"ShowBanner", 1);
 }
 
+// The sound for a new card, as Windows would play it for the banner (see CreateFileW_Hook): not for silent toasts,
+// with notification sounds turned off (for all apps or for this one), or for a toast that isn't fresh (cards made
+// for toasts already there when the mod starts). Looping sounds stay with the banner. Returns whether it played.
+bool PlayCardSound(const ToastInfo& info, const std::wstring& file) {
+    if (info.silent || info.sound.find(L"Looping") != std::wstring::npos) {
+        return false;
+    }
+    const std::wstring settings = L"Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings";
+    if (!UserDword(settings, L"NOC_GLOBAL_SETTING_ALLOW_NOTIFICATION_SOUND", 1) ||
+        (!info.aumid.empty() && !UserDword(settings + L"\\" + info.aumid, L"SoundFile", 1))) {
+        return false;
+    }
+    if (info.arrival) {
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        long long now = ((long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        if (now - info.arrival > 30LL * 10000000) {
+            return false;
+        }
+    }
+    using PlaySoundFn = BOOL(WINAPI*)(LPCWSTR, HMODULE, DWORD);
+    static PlaySoundFn playSound = (PlaySoundFn)(void*)GetProcAddress(LoadLibraryW(L"winmm.dll"), "PlaySoundW");
+    if (!playSound) {
+        return false;
+    }
+    // SND_ALIAS | SND_ASYNC | SND_NODEFAULT | SND_SYSTEM: the sound from the Windows sound scheme, on the system
+    // sounds volume, without blocking the card thread.
+    constexpr DWORD kFlags = 0x00010000 | 0x0001 | 0x0002 | 0x00200000;
+    // Own file from the settings (SND_FILENAME instead of SND_ALIAS); a missing or broken file falls back to Windows'.
+    if (!file.empty() && playSound(file.c_str(), nullptr, (kFlags & ~0x00010000) | 0x00020000)) {
+        Log(L"Card sound played (own file)");
+        return true;
+    }
+    std::wstring alias = info.sound.empty() ? L"Notification.Default" : info.sound;
+    if (!playSound(alias.c_str(), nullptr, kFlags) && alias != L"Notification.Default") {
+        playSound(L"Notification.Default", nullptr, kFlags);
+    }
+    Log(L"Card sound played");
+    return true;
+}
+
 ToastInfo ToastFromPayload(const std::string& payload, const std::wstring& aumid) {
     ToastInfo info;
     std::vector<std::wstring> texts;
@@ -904,6 +964,15 @@ ToastInfo ToastFromPayload(const std::string& payload, const std::wstring& aumid
     }
     std::string scenario = Attribute(payload.substr(0, payload.find('>')), "scenario");
     info.priority = scenario == "reminder" || scenario == "alarm" || scenario == "incomingCall" || scenario == "urgent";
+    for (auto& [tag, content] : Elements(payload, "audio")) {
+        info.silent = Attribute(tag, "silent") == "true";
+        std::string src = Attribute(tag, "src");
+        if (src.rfind("ms-winsoundevent:", 0) == 0) {
+            info.sound = FromUtf8(src.substr(17));
+        }
+        break;
+    }
+    info.aumid = aumid;
     info.app = AppName(aumid);
     info.image = AvatarFromPayload(payload, aumid);
     if (info.image.empty()) {
@@ -1825,6 +1894,8 @@ struct Settings {
     bool copyCodes = true;
     bool copyInSystemLanguage = true;
     bool markdown = true;
+    int soundMode = 0;  // 0 when the card shows, 1 as Windows plays it, 2 none
+    std::wstring soundFile;
     UINT32 priorityColor = 0xF0A020;  // reminders, alarms, calls
     std::vector<AppRule> rules;
 } g_settings;
@@ -1876,6 +1947,12 @@ void LoadSettings() {
     s.copyCodes = Wh_GetIntSetting(L"behavior.copyCodes") != 0;
     s.copyInSystemLanguage = Wh_GetIntSetting(L"behavior.copyInSystemLanguage") != 0;
     s.markdown = Wh_GetIntSetting(L"behavior.markdown") != 0;
+    std::wstring soundMode = StringSetting(L"sound.mode");
+    s.soundMode = soundMode == L"windows" ? 1 : soundMode == L"off" ? 2 : 0;
+    s.soundFile = StringSetting(L"sound.file");
+    if (s.soundFile.size() >= 2 && s.soundFile.front() == L'"' && s.soundFile.back() == L'"') {
+        s.soundFile = s.soundFile.substr(1, s.soundFile.size() - 2);  // "Copy as path" adds quotes
+    }
     if (UINT32 color = ColorSetting(L"behavior.priorityColor"); color != kNoColor) {
         s.priorityColor = color;
     }
@@ -2489,6 +2566,7 @@ void ApplySnapshot() {
     std::erase_if(g_skipped, [&](const std::wstring& id) {
         return std::none_of(snapshot.begin(), snapshot.end(), [&](const ToastInfo& t) { return t.id == id; });
     });
+    bool played = false;
     for (auto& info : snapshot) {
         bool have = std::any_of(g_cards.begin(), g_cards.end(), [&](const Card& c) { return c.info.id == info.id; });
         if (have || std::find(g_skipped.begin(), g_skipped.end(), info.id) != g_skipped.end()) {
@@ -2529,6 +2607,9 @@ void ApplySnapshot() {
         card.shownAt = now;
         LayoutCard(card);
         g_cards.push_back(card);
+        if (!played && g_settings.soundMode == 0) {
+            played = PlayCardSound(info, g_settings.soundFile);  // one sound for cards that come together
+        }
     }
     // Over the limit, the oldest cards still showing fade out. Not reminders, alarms and calls: their banner is hidden
     // too, so they would vanish while still waiting to be handled.
@@ -3417,6 +3498,34 @@ void StopCards() {
 // and the shell's explorer also reads the toasts and draws the cards (IsShellProcess). Windhawk's separate "tool mod"
 // process didn't survive reloads, and explorer is always running anyway.
 
+// Sound: ShellExperienceHost plays a toast's sound by opening its .wav when the banner comes up, and banners come one
+// at a time (about 7 s each), so with the cards the sounds would keep coming after the cards are gone. While the card
+// window exists, opening a sound from %WINDIR%\Media fails there, and the card thread plays one sound per new batch
+// of cards (PlayCardSound). Looping alarm and call sounds (Alarm*, Ring*) stay with Windows: those toasts wait for
+// their banner anyway.
+using CreateFileW_t = decltype(&CreateFileW);
+CreateFileW_t CreateFileW_Original;
+HANDLE WINAPI CreateFileW_Hook(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disposition,
+                               DWORD flags, HANDLE templateFile) {
+    if (name) {
+        size_t n = wcslen(name);
+        const WCHAR* file = wcsrchr(name, L'\\');
+        file = file ? file + 1 : name;
+        bool inMedia = false;
+        for (const WCHAR* p = name; *p && !inMedia; p++) {
+            inMedia = _wcsnicmp(p, L"\\Media\\", 7) == 0;
+        }
+        if (n > 4 && _wcsicmp(name + n - 4, L".wav") == 0 && inMedia &&
+            _wcsnicmp(file, L"Alarm", 5) != 0 && _wcsnicmp(file, L"Ring", 4) != 0 && g_settings.soundMode != 1 &&
+            FindWindowW(kWindowClass, nullptr)) {
+            Log(L"Banner sound muted");
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    }
+    return CreateFileW_Original(name, access, share, sa, disposition, flags, templateFile);
+}
+
 BOOL Wh_ModInit() {
     WCHAR path[MAX_PATH];
     if (!GetModuleFileName(nullptr, path, ARRAYSIZE(path))) {
@@ -3429,6 +3538,9 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
     WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook, &SetWindowPos_Original);
+    if (!explorer) {
+        WindhawkUtils::SetFunctionHook(CreateFileW, CreateFileW_Hook, &CreateFileW_Original);
+    }
     g_explorer = explorer;
     Log(L"Loaded in %s", base);
     return TRUE;

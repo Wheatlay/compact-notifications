@@ -19,6 +19,12 @@ Windhawk mod that replaces Windows toast banners with compact chat-style cards. 
   banner shows the toast later, it is matched to the card (by title and the start of the text) instead of making a
   second one. Toasts the database doesn't have (older Firefox versions) are read from the banner through UI
   Automation.
+- Sound: `ShellExperienceHost` plays a toast's sound by opening its `.wav` from `%WINDIR%\Media` when the banner
+  comes up, so with the queue the sounds came after the cards were gone. While the card window exists, a
+  `CreateFileW` hook there fails those opens (except the looping `Alarm*`/`Ring*`), and the card thread plays one sound
+  (`PlaySound` alias from `<audio src="ms-winsoundevent:…">`, else `Notification.Default`) per batch of new cards. It
+  keeps Windows' choices: `<audio silent="true">`, `NOC_GLOBAL_SETTING_ALLOW_NOTIFICATION_SOUND`, the app's
+  `SoundFile` (its "Play a sound" switch), and no sound for toasts older than 30 s. Muted apps get no card, so no sound.
 - Drawing: a layered, never-activated window in the shell's `explorer.exe` (Direct2D/DirectWrite/WIC). Click and
   × go through UI Automation to the banner, so the app gets its real action.
 - Replies are typed on the card itself (the card window takes the keyboard while its reply box is focused). The text
